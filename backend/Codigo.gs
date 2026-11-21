@@ -1,0 +1,2310 @@
+// Backend do Bolão da Sorte. Versão 10: papel 'publicidade', novos espaços de propaganda, relógio, aba Usuários.
+// (Gerado a partir de shared/ e backend/src/; o bloco 14 no fim do arquivo é novo.)
+
+// ======================= shared/regras.js =======================
+/**
+ * Regras das modalidades e validação de jogos e bolões.
+ * Funciona em Node (testes), navegador e Apps Script (V8).
+ * Os valores padrão abaixo (inclusive as faixas de premiação) devem ser conferidos
+ * com as regras oficiais da CAIXA antes de abrir inscrições.
+ */
+(function (root) {
+  'use strict';
+
+  // universo: números de 1 a `maximo`; dezenas: quantidade permitida por jogo.
+  var MODALIDADES = {
+    'mega-sena': { nome: 'Mega-Sena', minimo: 1, maximo: 60, dezenasMin: 6, dezenasMax: 20, sorteados: 6,
+      faixas: [{ acertos: 6, nome: 'Sena' }, { acertos: 5, nome: 'Quina' }, { acertos: 4, nome: 'Quadra' }] },
+    'lotofacil': { nome: 'Lotofácil', minimo: 1, maximo: 25, dezenasMin: 15, dezenasMax: 20, sorteados: 15,
+      faixas: [{ acertos: 15, nome: '15 acertos' }, { acertos: 14, nome: '14 acertos' }, { acertos: 13, nome: '13 acertos' }, { acertos: 12, nome: '12 acertos' }, { acertos: 11, nome: '11 acertos' }] },
+    'quina': { nome: 'Quina', minimo: 1, maximo: 80, dezenasMin: 5, dezenasMax: 15, sorteados: 5,
+      faixas: [{ acertos: 5, nome: 'Quina' }, { acertos: 4, nome: 'Quadra' }, { acertos: 3, nome: 'Terno' }, { acertos: 2, nome: 'Duque' }] },
+    'dia-de-sorte': { nome: 'Dia de Sorte', minimo: 1, maximo: 31, dezenasMin: 7, dezenasMax: 15, sorteados: 7,
+      faixas: [{ acertos: 7, nome: '7 acertos' }, { acertos: 6, nome: '6 acertos' }, { acertos: 5, nome: '5 acertos' }, { acertos: 4, nome: '4 acertos' }] }
+  };
+
+  function obterModalidade(id) {
+    return MODALIDADES[id] || null;
+  }
+
+  /**
+   * Valida a configuração de um bolão criada pelo administrador.
+   * Retorna { ok: boolean, erros: string[] }.
+   */
+  function validarBolao(cfg) {
+    var erros = [];
+    if (!cfg || typeof cfg !== 'object') return { ok: false, erros: ['Configuração ausente.'] };
+    var mod = obterModalidade(cfg.modalidade);
+    if (!mod) erros.push('Modalidade desconhecida.');
+    if (!cfg.nome || String(cfg.nome).trim() === '') erros.push('Nome obrigatório.');
+    if (!Number.isInteger(cfg.qtdNumeros)) {
+      erros.push('Quantidade de números deve ser inteira.');
+    } else if (mod && (cfg.qtdNumeros < mod.dezenasMin || cfg.qtdNumeros > mod.dezenasMax)) {
+      erros.push('Quantidade de números deve estar entre ' + mod.dezenasMin + ' e ' + mod.dezenasMax + ' para ' + mod.nome + '.');
+    }
+    if (!Number.isInteger(cfg.valorCotaCentavos) || cfg.valorCotaCentavos <= 0) {
+      erros.push('Valor da cota deve ser um inteiro positivo em centavos.');
+    }
+    if (!Number.isInteger(cfg.jogosPorCota) || cfg.jogosPorCota < 1) {
+      erros.push('Jogos por cota deve ser um inteiro maior ou igual a 1.');
+    }
+    if (!Number.isInteger(cfg.limiteCotas) || cfg.limiteCotas < 1) {
+      erros.push('Limite de cotas deve ser um inteiro maior ou igual a 1.');
+    }
+    return { ok: erros.length === 0, erros: erros };
+  }
+
+  /**
+   * Valida um jogo (lista de números) contra a configuração do bolão.
+   * Retorna { ok, erros, numeros } com os números ordenados quando válido.
+   */
+  function validarJogo(numeros, cfg) {
+    var erros = [];
+    var mod = obterModalidade(cfg && cfg.modalidade);
+    if (!mod) return { ok: false, erros: ['Modalidade desconhecida.'], numeros: [] };
+    if (!Array.isArray(numeros)) return { ok: false, erros: ['Jogo inválido.'], numeros: [] };
+
+    for (var i = 0; i < numeros.length; i++) {
+      if (!Number.isInteger(numeros[i])) {
+        return { ok: false, erros: ['Todos os números devem ser inteiros.'], numeros: [] };
+      }
+    }
+    if (numeros.length !== cfg.qtdNumeros) {
+      erros.push('O jogo deve ter exatamente ' + cfg.qtdNumeros + ' números.');
+    }
+    var vistos = {};
+    for (var j = 0; j < numeros.length; j++) {
+      var n = numeros[j];
+      if (n < mod.minimo || n > mod.maximo) {
+        erros.push('Número ' + n + ' fora do intervalo ' + mod.minimo + ' a ' + mod.maximo + '.');
+      }
+      if (vistos[n]) erros.push('Número ' + n + ' repetido.');
+      vistos[n] = true;
+    }
+    var ordenados = numeros.slice().sort(function (a, b) { return a - b; });
+    return { ok: erros.length === 0, erros: erros, numeros: ordenados };
+  }
+
+  /** Um jogo igual (mesmos números) já existe na lista da cota? */
+  function chaveJogo(numerosOrdenados) {
+    return numerosOrdenados.join('-');
+  }
+
+  var api = {
+    MODALIDADES: MODALIDADES,
+    obterModalidade: obterModalidade,
+    validarBolao: validarBolao,
+    validarJogo: validarJogo,
+    chaveJogo: chaveJogo
+  };
+
+  root.BolaoRegras = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
+// ======================= shared/rateio.js =======================
+/**
+ * Rateio igualitário em centavos inteiros e estados da cota.
+ * Funciona em Node (testes), navegador e Apps Script (V8).
+ */
+(function (root) {
+  'use strict';
+
+  /**
+   * Divide o prêmio (em centavos) igualmente entre `cotasConfirmadas` cotas.
+   * Regra do resto: os centavos que sobram são distribuídos 1 a 1,
+   * começando pelas primeiras cotas na ordem de confirmação.
+   * Retorna { porCota: number[], base, resto, total }.
+   */
+  function ratear(premioCentavos, cotasConfirmadas) {
+    if (!Number.isInteger(premioCentavos) || premioCentavos < 0) {
+      throw new Error('Prêmio deve ser um inteiro não negativo em centavos.');
+    }
+    if (!Number.isInteger(cotasConfirmadas) || cotasConfirmadas < 1) {
+      throw new Error('É preciso ao menos 1 cota confirmada.');
+    }
+    var base = Math.floor(premioCentavos / cotasConfirmadas);
+    var resto = premioCentavos - base * cotasConfirmadas;
+    var porCota = [];
+    for (var i = 0; i < cotasConfirmadas; i++) {
+      porCota.push(base + (i < resto ? 1 : 0));
+    }
+    return { porCota: porCota, base: base, resto: resto, total: premioCentavos };
+  }
+
+  // Estados da cota e transições permitidas.
+  var ESTADOS = {
+    RASCUNHO: 'rascunho',
+    COMPLETA: 'completa',
+    AGUARDANDO: 'aguardando_pagamento',
+    CONFIRMADA: 'confirmada',
+    EXPIRADA: 'expirada'
+  };
+
+  var TRANSICOES = {
+    rascunho: ['completa', 'expirada'],
+    completa: ['rascunho', 'aguardando_pagamento', 'expirada'],
+    aguardando_pagamento: ['confirmada', 'completa', 'rascunho', 'expirada'],
+    confirmada: [],
+    expirada: []
+  };
+
+  function podeTransitar(de, para) {
+    return !!TRANSICOES[de] && TRANSICOES[de].indexOf(para) !== -1;
+  }
+
+  /** Uma cota só fica "completa" quando tem exatamente jogosPorCota jogos válidos. */
+  function cotaCompleta(qtdJogosValidos, jogosPorCota) {
+    return Number.isInteger(qtdJogosValidos) && qtdJogosValidos === jogosPorCota;
+  }
+
+  var api = {
+    ratear: ratear,
+    ESTADOS: ESTADOS,
+    podeTransitar: podeTransitar,
+    cotaCompleta: cotaCompleta
+  };
+
+  root.BolaoRateio = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
+// ======================= shared/pix.js =======================
+/**
+ * Gerador de PIX "copia e cola" (BR Code estático, padrão EMV do Banco Central).
+ * Não há integração bancária: o código é gerado localmente e o pagamento
+ * é confirmado manualmente pelo administrador.
+ * Funciona em Node (testes), navegador e Apps Script (V8).
+ */
+(function (root) {
+  'use strict';
+
+  function campo(id, valor) {
+    var tam = String(valor.length);
+    if (tam.length < 2) tam = '0' + tam;
+    return id + tam + valor;
+  }
+
+  /** CRC16/CCITT-FALSE: polinômio 0x1021, valor inicial 0xFFFF. */
+  function crc16(texto) {
+    var crc = 0xFFFF;
+    for (var i = 0; i < texto.length; i++) {
+      crc ^= (texto.charCodeAt(i) & 0xFF) << 8;
+      for (var b = 0; b < 8; b++) {
+        crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+        crc &= 0xFFFF;
+      }
+    }
+    var hex = crc.toString(16).toUpperCase();
+    while (hex.length < 4) hex = '0' + hex;
+    return hex;
+  }
+
+  /** Maiúsculas, sem acentos, só ASCII imprimível. */
+  function limparTexto(txt, max) {
+    var s = String(txt || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase()
+      .replace(/[^\x20-\x7E]/g, '')
+      .trim();
+    return s.substring(0, max);
+  }
+
+  function centavosParaDecimal(centavos) {
+    var reais = Math.floor(centavos / 100);
+    var cent = centavos % 100;
+    return reais + '.' + (cent < 10 ? '0' : '') + cent;
+  }
+
+  /**
+   * gerarPix({ chave, nomeRecebedor, cidade, valorCentavos, txid })
+   * Retorna a string do "copia e cola".
+   */
+  function gerarPix(dados) {
+    if (!dados || !dados.chave || String(dados.chave).trim() === '') {
+      throw new Error('Chave PIX obrigatória.');
+    }
+    if (!Number.isInteger(dados.valorCentavos) || dados.valorCentavos <= 0) {
+      throw new Error('Valor deve ser um inteiro positivo em centavos.');
+    }
+    var nome = limparTexto(dados.nomeRecebedor, 25);
+    var cidade = limparTexto(dados.cidade, 15);
+    if (!nome) throw new Error('Nome do recebedor obrigatório.');
+    if (!cidade) throw new Error('Cidade obrigatória.');
+
+    var txid = String(dados.txid || '***').replace(/[^A-Za-z0-9]/g, '').substring(0, 25);
+    if (!txid) txid = '***';
+
+    var conta = campo('00', 'br.gov.bcb.pix') + campo('01', String(dados.chave).trim());
+    var corpo =
+      campo('00', '01') +
+      campo('01', '11') +
+      campo('26', conta) +
+      campo('52', '0000') +
+      campo('53', '986') +
+      campo('54', centavosParaDecimal(dados.valorCentavos)) +
+      campo('58', 'BR') +
+      campo('59', nome) +
+      campo('60', cidade) +
+      campo('62', campo('05', txid)) +
+      '6304';
+    return corpo + crc16(corpo);
+  }
+
+  /** Lê os campos de primeiro nível (usado nos testes). */
+  function lerCampos(codigo) {
+    var campos = {};
+    var i = 0;
+    while (i < codigo.length) {
+      var id = codigo.substr(i, 2);
+      var tam = parseInt(codigo.substr(i + 2, 2), 10);
+      campos[id] = codigo.substr(i + 4, tam);
+      i += 4 + tam;
+    }
+    return campos;
+  }
+
+  /** Confere se o CRC do código bate com o conteúdo. */
+  function validarCrc(codigo) {
+    if (typeof codigo !== 'string' || codigo.length < 8) return false;
+    var corpo = codigo.substring(0, codigo.length - 4);
+    return crc16(corpo) === codigo.substring(codigo.length - 4);
+  }
+
+  var api = {
+    gerarPix: gerarPix,
+    crc16: crc16,
+    lerCampos: lerCampos,
+    validarCrc: validarCrc
+  };
+
+  root.BolaoPix = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
+// ======================= shared/conferencia.js =======================
+/**
+ * Conferência de jogos contra o resultado oficial e comparação com os jogos registrados na lotérica.
+ * Funciona em Node (testes) e Apps Script (V8). Depende de regras.js.
+ */
+(function (root) {
+  'use strict';
+  var Regras = root.BolaoRegras || (typeof require !== 'undefined' ? require('./regras.js') : null);
+
+  /** Número de combinações C(n, k). */
+  function comb(n, k) {
+    if (k < 0 || k > n) return 0;
+    k = Math.min(k, n - k);
+    var r = 1;
+    for (var i = 1; i <= k; i++) r = r * (n - k + i) / i;
+    return Math.round(r);
+  }
+
+  /** Valida as dezenas sorteadas: quantidade certa, distintas e dentro do intervalo. */
+  function validarResultado(numeros, modalidade) {
+    var mod = Regras.obterModalidade(modalidade);
+    if (!mod) return { ok: false, erros: ['Modalidade desconhecida.'], numeros: [] };
+    if (!Array.isArray(numeros) || numeros.some(function (n) { return !Number.isInteger(n); })) {
+      return { ok: false, erros: ['O resultado deve ser uma lista de números inteiros.'], numeros: [] };
+    }
+    var erros = [];
+    if (numeros.length !== mod.sorteados) erros.push('O resultado de ' + mod.nome + ' tem ' + mod.sorteados + ' dezenas.');
+    var vistos = {};
+    numeros.forEach(function (n) {
+      if (n < mod.minimo || n > mod.maximo) erros.push('Dezena ' + n + ' fora do intervalo ' + mod.minimo + ' a ' + mod.maximo + '.');
+      if (vistos[n]) erros.push('Dezena ' + n + ' repetida.');
+      vistos[n] = true;
+    });
+    return { ok: erros.length === 0, erros: erros, numeros: numeros.slice().sort(function (a, b) { return a - b; }) };
+  }
+
+  /**
+   * Confere um jogo (que pode ter mais números que o sorteio, como uma aposta múltipla).
+   * Para cada faixa, `quantidade` = quantas combinações do jogo caem nela: C(h, f) * C(n - h, sorteados - f).
+   */
+  function conferirJogo(jogo, resultado, modalidade) {
+    var mod = Regras.obterModalidade(modalidade);
+    var sorteado = {};
+    resultado.forEach(function (n) { sorteado[n] = true; });
+    var acertados = jogo.filter(function (n) { return sorteado[n]; });
+    var h = acertados.length;
+    var n = jogo.length;
+    var premios = [];
+    mod.faixas.forEach(function (f) {
+      var q = comb(h, f.acertos) * comb(n - h, mod.sorteados - f.acertos);
+      if (q > 0) premios.push({ nome: f.nome, acertos: f.acertos, quantidade: q });
+    });
+    return { acertos: h, acertados: acertados, premios: premios };
+  }
+
+  /**
+   * Lê jogos de um texto colado (ex.: linhas do comprovante). Cada linha com exatamente `qtd`
+   * dezenas válidas vira um jogo; letras e outros textos ao redor são ignorados.
+   */
+  function extrairJogos(texto, qtd, modalidade) {
+    var jogos = [];
+    var ignoradas = [];
+    String(texto === undefined || texto === null ? '' : texto).split(/\r?\n/).forEach(function (linha) {
+      if (linha.trim() === '') return;
+      var original = linha;
+      linha = linha.replace(/^\s*[A-Za-zÀ-ú]+\s*\d*\s*[:.)]\s*/, ''); // tira rótulos como "Jogo 1:" ou "A)"
+      var nums = (linha.match(/(?:^|[^0-9])(\d{1,2})(?![0-9])/g) || []).map(function (m) { return Number(m.replace(/[^0-9]/g, '')); });
+      var v = nums.length === qtd ? Regras.validarJogo(nums, { modalidade: modalidade, qtdNumeros: qtd }) : { ok: false };
+      if (v.ok) jogos.push(v.numeros); else ignoradas.push(original.trim());
+    });
+    return { jogos: jogos, ignoradas: ignoradas };
+  }
+
+  /** Compara dois conjuntos de jogos como multiconjuntos (a ordem dos jogos não importa). */
+  function compararJogos(registrados, sistema) {
+    var contagem = {};
+    sistema.forEach(function (j) { var k = Regras.chaveJogo(j); contagem[k] = (contagem[k] || 0) + 1; });
+    var sobram = [];
+    var iguais = 0;
+    registrados.forEach(function (j) {
+      var k = Regras.chaveJogo(j);
+      if (contagem[k] > 0) { contagem[k]--; iguais++; } else sobram.push(j);
+    });
+    var faltam = [];
+    sistema.forEach(function (j) {
+      var k = Regras.chaveJogo(j);
+      if (contagem[k] > 0) { contagem[k]--; faltam.push(j); }
+    });
+    return { iguais: iguais, faltamNoRegistro: faltam, sobramNoRegistro: sobram };
+  }
+
+  var api = { comb: comb, validarResultado: validarResultado, conferirJogo: conferirJogo, extrairJogos: extrairJogos, compararJogos: compararJogos };
+  root.BolaoConferencia = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
+// ======================= backend/src/01_base.js =======================
+// ===== Base: configuração, erros, utilitários =====
+var G = (typeof globalThis !== 'undefined') ? globalThis : this;
+var Regras = G.BolaoRegras;
+var Rateio = G.BolaoRateio;
+var Pix = G.BolaoPix;
+var Conf = G.BolaoConferencia;
+
+var CFG = {
+  ABAS: {
+    Usuarios: ['id', 'usuario', 'nome', 'hashSenha', 'papel', 'status', 'tentativas', 'bloqueadoAte', 'criadoEm', 'conviteId'],
+    Convites: ['id', 'codigoHash', 'papel', 'criadoPor', 'criadoEm', 'expiraEm', 'status', 'usadoPor', 'usadoEm'],
+    Sessoes: ['tokenHash', 'userId', 'criadoEm', 'expiraEm'],
+    Boloes: ['id', 'nome', 'modalidade', 'qtdNumeros', 'valorCotaCentavos', 'jogosPorCota', 'limiteCotas', 'maxCotasPorPessoa', 'prazo', 'status', 'criadoPor', 'criadoEm', 'atualizadoEm', 'concurso', 'registradoEm'],
+    Cotas: ['id', 'bolaoId', 'userId', 'status', 'criadoEm', 'atualizadoEm', 'confirmadaEm', 'pixGeradoEm', 'observacao'],
+    Jogos: ['id', 'cotaId', 'numeros', 'criadoEm'],
+    Config: ['chave', 'valor'],
+    Banners: ['id', 'imagemId', 'titulo', 'link', 'ativo', 'ordem', 'criadoEm'],
+    Imagens: ['id', 'parte', 'tipo', 'dados', 'criadoEm'],
+    Auditoria: ['id', 'bolaoId', 'tipo', 'imagemId', 'texto', 'criadoEm'],
+    Conferencias: ['id', 'modalidade', 'concurso', 'resultado', 'premiados', 'criadoEm']
+  },
+  COLUNAS_NUM: ['tentativas', 'bloqueadoAte', 'criadoEm', 'expiraEm', 'usadoEm', 'qtdNumeros', 'valorCotaCentavos',
+    'jogosPorCota', 'limiteCotas', 'maxCotasPorPessoa', 'prazo', 'atualizadoEm', 'confirmadaEm', 'pixGeradoEm',
+    'parte', 'ordem', 'ativo', 'concurso', 'registradoEm', 'premiados'],
+  SESSAO_MS: 7 * 24 * 3600 * 1000,
+  MAX_TENTATIVAS: 5,
+  BLOQUEIO_MS: 10 * 60 * 1000,
+  HASH_ITER_PADRAO: 1500,
+  CONVITE_HORAS_PADRAO: 72,
+  COTA_ABANDONO_MS: 48 * 3600 * 1000, // cota em rascunho/completa sem atividade por 48h libera a vaga
+  IMG_MAX_B64: 300000,  // tamanho máximo da imagem em base64 (cerca de 225 KB)
+  IMG_PARTE: 30000,     // cada célula guarda no máximo 30 mil caracteres
+  MAX_BANNERS: 10
+};
+
+var RELOGIO = { agora: function () { return Date.now(); } };
+
+function erroNegocio(msg) {
+  var e = new Error(msg);
+  e.negocio = true;
+  return e;
+}
+
+function props() {
+  return PropertiesService.getScriptProperties();
+}
+
+function novoId() {
+  return Utilities.getUuid();
+}
+
+function aleatorioHex(n) {
+  var s = '';
+  while (s.length < n) s += Utilities.getUuid().replace(/-/g, '');
+  return s.substring(0, n);
+}
+
+function bytesParaHex(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i];
+    if (b < 0) b += 256;
+    var h = b.toString(16);
+    if (h.length < 2) h = '0' + h;
+    s += h;
+  }
+  return s;
+}
+
+function sha256Hex(texto) {
+  return bytesParaHex(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, texto, Utilities.Charset.UTF_8));
+}
+
+/** Remove caracteres de controle e prefixos que viram fórmula na planilha. */
+function limparTexto(t, max) {
+  return String(t === undefined || t === null ? '' : t)
+    .replace(/[\u0000-\u001f]/g, '')
+    .replace(/^[=+\-@\s]+/, '')
+    .trim()
+    .substring(0, max);
+}
+
+/** Script Lock não é reentrante aqui: nunca chamar comLock dentro de comLock. */
+function comLock(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// ======================= backend/src/02_dados.js =======================
+// ===== Acesso à planilha =====
+var PLANILHA_EM_CACHE = null; // vale só durante uma execução (cada chamada à API reinicia as variáveis globais)
+
+function planilha() {
+  if (PLANILHA_EM_CACHE) return PLANILHA_EM_CACHE;
+  var id = props().getProperty('PLANILHA_ID');
+  if (!id) throw new Error('Execute configurar() primeiro.');
+  PLANILHA_EM_CACHE = SpreadsheetApp.openById(id);
+  return PLANILHA_EM_CACHE;
+}
+
+/** Devolve a aba; se ela ainda não existe (versão nova do sistema), cria com o cabeçalho. */
+function aba(nome) {
+  var ss = planilha();
+  var s = ss.getSheetByName(nome);
+  if (!s) {
+    var cols = CFG.ABAS[nome];
+    if (!cols) throw new Error('Aba desconhecida: ' + nome);
+    try {
+      s = ss.insertSheet(nome);
+    } catch (e) {
+      s = ss.getSheetByName(nome); // outra execução criou ao mesmo tempo
+      if (!s) throw e;
+    }
+    s.getRange(1, 1, 1, cols.length).setValues([cols]);
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+function ehNumerica(col) {
+  return CFG.COLUNAS_NUM.indexOf(col) !== -1;
+}
+
+/**
+ * O Planilhas converte texto parecido com número, data ou fórmula ("12e4", "0123", "1-2-3", "TRUE").
+ * Para isso nunca acontecer, todo texto é gravado com o prefixo "~" e o prefixo é removido na leitura.
+ */
+function codificarTexto(v) {
+  var s = String(v === undefined || v === null ? '' : v);
+  return s === '' ? '' : '~' + s;
+}
+
+function decodificarTexto(v) {
+  var s = String(v === undefined || v === null ? '' : v);
+  return s.charAt(0) === '~' ? s.substring(1) : s;
+}
+
+/** Lê a aba como lista de objetos (com _linha). Textos ficam texto, números ficam número. */
+function lerTabela(nome) {
+  var cols = CFG.ABAS[nome];
+  var vals = aba(nome).getDataRange().getValues();
+  var out = [];
+  for (var r = 1; r < vals.length; r++) {
+    if (vals[r][0] === '' || vals[r][0] === null || vals[r][0] === undefined) continue;
+    var obj = { _linha: r + 1 };
+    for (var c = 0; c < cols.length; c++) {
+      var v = vals[r][c];
+      if (v === undefined || v === null) v = '';
+      if (ehNumerica(cols[c])) obj[cols[c]] = (v === '' ? '' : Number(v));
+      else obj[cols[c]] = decodificarTexto(v);
+    }
+    out.push(obj);
+  }
+  return out;
+}
+
+function linhaDe(nome, obj) {
+  var cols = CFG.ABAS[nome];
+  var linha = [];
+  for (var c = 0; c < cols.length; c++) {
+    var v = obj[cols[c]] === undefined ? '' : obj[cols[c]];
+    linha.push(ehNumerica(cols[c]) ? v : codificarTexto(v));
+  }
+  return linha;
+}
+
+function inserir(nome, obj) {
+  aba(nome).appendRow(linhaDe(nome, obj));
+}
+
+function atualizar(nome, linha, obj) {
+  var cols = CFG.ABAS[nome];
+  aba(nome).getRange(linha, 1, 1, cols.length).setValues([linhaDe(nome, obj)]);
+}
+
+function removerLinha(nome, linha) {
+  aba(nome).deleteRow(linha);
+}
+
+
+// ======================= backend/src/03_auth.js =======================
+// ===== Autenticação: senha, convite, cadastro, login, sessão =====
+function iteracoesHash() {
+  var v = parseInt(props().getProperty('HASH_ITER'), 10);
+  return (v > 0) ? v : CFG.HASH_ITER_PADRAO;
+}
+
+/** Formato: v1$iteracoes$salt$hash (SHA-256 iterado com salt individual). */
+function hashSenha(senha, iter) {
+  var salt = aleatorioHex(32);
+  var h = sha256Hex(salt + '|' + senha);
+  for (var i = 0; i < iter; i++) h = sha256Hex(h + '|' + salt + '|' + senha);
+  return 'v1$' + iter + '$' + salt + '$' + h;
+}
+
+function comparaConstante(a, b) {
+  if (a.length !== b.length) return false;
+  var r = 0;
+  for (var i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+function verificarSenha(senha, registro) {
+  var p = String(registro).split('$');
+  if (p.length !== 4 || p[0] !== 'v1') return false;
+  var iter = parseInt(p[1], 10);
+  if (!(iter > 0)) return false;
+  var h = sha256Hex(p[2] + '|' + senha);
+  for (var i = 0; i < iter; i++) h = sha256Hex(h + '|' + p[2] + '|' + senha);
+  return comparaConstante(h, p[3]);
+}
+
+/** Quantas iterações o hash guardado usa (formato v1$iteracoes$salt$hash); 0 se o formato for desconhecido. */
+function iteracaoDoHash(registro) {
+  var p = String(registro).split('$');
+  return (p.length === 4 && p[0] === 'v1') ? (parseInt(p[1], 10) || 0) : 0;
+}
+
+function normalizarUsuario(u) {
+  return String(u === undefined || u === null ? '' : u).trim().toLowerCase();
+}
+
+function validarUsuario(u) {
+  if (!/^[a-z0-9._-]{3,30}$/.test(u)) {
+    throw erroNegocio('Usuário deve ter de 3 a 30 caracteres: letras minúsculas, números, ponto, hífen ou sublinhado.');
+  }
+}
+
+function validarSenha(senha, usuario) {
+  if (typeof senha !== 'string' || senha.length < 8) throw erroNegocio('A senha deve ter pelo menos 8 caracteres.');
+  if (senha.length > 100) throw erroNegocio('A senha deve ter no máximo 100 caracteres.');
+  if (senha.toLowerCase() === usuario) throw erroNegocio('A senha não pode ser igual ao usuário.');
+}
+
+// ----- convites -----
+function normalizarCodigo(c) {
+  return String(c === undefined || c === null ? '' : c).toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function hashCodigo(codigoNormalizado) {
+  return sha256Hex('convite|' + codigoNormalizado);
+}
+
+function gerarCodigoConvite() {
+  var h = aleatorioHex(20).toUpperCase();
+  return h.substring(0, 5) + '-' + h.substring(5, 10) + '-' + h.substring(10, 15) + '-' + h.substring(15, 20);
+}
+
+/** Cria o convite e devolve o código em texto puro uma única vez (só o hash é guardado). */
+function criarConviteInterno(papel, criadoPor, horas) {
+  if (['participante', 'admin', 'publicidade'].indexOf(papel) === -1) throw erroNegocio('Papel inválido.');
+  var h = (horas === undefined || horas === null) ? CFG.CONVITE_HORAS_PADRAO : horas;
+  if (!Number.isInteger(h) || h < 1 || h > 24 * 30) throw erroNegocio('Validade deve ser de 1 a 720 horas.');
+  var agora = RELOGIO.agora();
+  var codigo = gerarCodigoConvite();
+  var id = novoId();
+  inserir('Convites', {
+    id: id, codigoHash: hashCodigo(normalizarCodigo(codigo)), papel: papel, criadoPor: criadoPor,
+    criadoEm: agora, expiraEm: agora + h * 3600 * 1000, status: 'ativo', usadoPor: '', usadoEm: ''
+  });
+  return { id: id, codigo: codigo, papel: papel, expiraEm: agora + h * 3600 * 1000 };
+}
+
+function criarConvite(admin, d) {
+  return comLock(function () {
+    return criarConviteInterno(d.papel || 'participante', admin.id, d.validadeHoras);
+  });
+}
+
+function listarConvites() {
+  var agora = RELOGIO.agora();
+  return lerTabela('Convites').map(function (c) {
+    var st = c.status;
+    if (st === 'ativo' && c.expiraEm < agora) st = 'expirado';
+    return { id: c.id, papel: c.papel, criadoEm: c.criadoEm, expiraEm: c.expiraEm, status: st, usadoPor: c.usadoPor, usadoEm: c.usadoEm };
+  });
+}
+
+function revogarConvite(d) {
+  return comLock(function () {
+    var c = lerTabela('Convites').filter(function (x) { return x.id === d.id; })[0];
+    if (!c) throw erroNegocio('Convite não encontrado.');
+    if (c.status !== 'ativo') throw erroNegocio('Só convites ativos podem ser revogados.');
+    c.status = 'revogado';
+    atualizar('Convites', c._linha, c);
+    return { id: c.id, status: 'revogado' };
+  });
+}
+
+// ----- sessões -----
+function limparSessoesExpiradas(agora) {
+  var t = lerTabela('Sessoes');
+  for (var i = t.length - 1; i >= 0; i--) {
+    if (t[i].expiraEm < agora) removerLinha('Sessoes', t[i]._linha);
+  }
+}
+
+/** Chamar somente dentro de comLock. Devolve o token em texto puro (só o hash é guardado). */
+function criarSessaoInterna(userId, agora) {
+  var token = aleatorioHex(64);
+  inserir('Sessoes', { tokenHash: sha256Hex('sessao|' + token), userId: userId, criadoEm: agora, expiraEm: agora + CFG.SESSAO_MS });
+  return token;
+}
+
+function usuarioPublico(u) {
+  return { id: u.id, usuario: u.usuario, nome: u.nome, papel: u.papel };
+}
+
+function autenticar(token) {
+  var invalida = erroNegocio('Sessão inválida ou expirada. Entre novamente.');
+  if (typeof token !== 'string' || token.length < 32) throw invalida;
+  var th = sha256Hex('sessao|' + token);
+  var agora = RELOGIO.agora();
+  var s = lerTabela('Sessoes').filter(function (x) { return x.tokenHash === th; })[0];
+  if (!s || s.expiraEm < agora) throw invalida;
+  var u = lerTabela('Usuarios').filter(function (x) { return x.id === s.userId; })[0];
+  if (!u || u.status !== 'ativo') throw invalida;
+  return u;
+}
+
+function exigirAdmin(token) {
+  var u = autenticar(token);
+  if (u.papel !== 'admin') throw erroNegocio('Acesso restrito ao administrador.');
+  return u;
+}
+
+/** Administrador principal OU administrador de propagandas (papel 'publicidade'). */
+function exigirAdminOuPublicidade(token) {
+  var u = autenticar(token);
+  if (u.papel !== 'admin' && u.papel !== 'publicidade') throw erroNegocio('Acesso restrito aos administradores.');
+  return u;
+}
+
+// ----- cadastro e login -----
+function cadastrar(d) {
+  var usuario = normalizarUsuario(d.usuario);
+  validarUsuario(usuario);
+  var nome = limparTexto(d.nome, 60);
+  if (nome.length < 2) throw erroNegocio('Informe seu nome (mínimo 2 caracteres).');
+  validarSenha(d.senha, usuario);
+
+  var cod = normalizarCodigo(d.codigoConvite);
+  var conviteInvalido = erroNegocio('Convite inválido ou expirado.');
+  if (cod.length !== 20) throw conviteInvalido;
+  var ch = hashCodigo(cod);
+  var achar = function () { return lerTabela('Convites').filter(function (c) { return c.codigoHash === ch; })[0]; };
+  var pre = achar();
+  if (!pre || pre.status !== 'ativo' || pre.expiraEm < RELOGIO.agora()) throw conviteInvalido;
+
+  var registro = hashSenha(d.senha, iteracoesHash()); // custo alto: fora do lock
+
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var conv = achar();
+    if (!conv || conv.status !== 'ativo' || conv.expiraEm < agora) throw conviteInvalido;
+    var existe = lerTabela('Usuarios').some(function (u) { return u.usuario === usuario; });
+    if (existe) throw erroNegocio('Este nome de usuário já está em uso.');
+    var id = novoId();
+    inserir('Usuarios', {
+      id: id, usuario: usuario, nome: nome, hashSenha: registro, papel: conv.papel, status: 'ativo',
+      tentativas: 0, bloqueadoAte: 0, criadoEm: agora, conviteId: conv.id
+    });
+    conv.status = 'usado';
+    conv.usadoPor = id;
+    conv.usadoEm = agora;
+    atualizar('Convites', conv._linha, conv);
+    var token = criarSessaoInterna(id, agora);
+    return { token: token, usuario: { id: id, usuario: usuario, nome: nome, papel: conv.papel } };
+  });
+}
+
+function login(d) {
+  var generico = erroNegocio('Usuário ou senha inválidos.');
+  var usuario = normalizarUsuario(d.usuario);
+  var senha = (typeof d.senha === 'string') ? d.senha : '';
+  var u = lerTabela('Usuarios').filter(function (x) { return x.usuario === usuario; })[0];
+
+  if (!u) {
+    hashSenha(senha, iteracoesHash()); // equaliza o tempo de resposta
+    throw generico;
+  }
+  if (u.status !== 'ativo') throw generico;
+  if (u.bloqueadoAte > RELOGIO.agora()) {
+    throw erroNegocio('Muitas tentativas. Tente novamente em alguns minutos.');
+  }
+
+  var ok = verificarSenha(senha, u.hashSenha); // fora do lock
+  // Contas criadas com outra quantidade de iterações são atualizadas no primeiro login certo.
+  var novoHash = (ok && iteracaoDoHash(u.hashSenha) !== iteracoesHash()) ? hashSenha(senha, iteracoesHash()) : null;
+
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var atual = lerTabela('Usuarios').filter(function (x) { return x.id === u.id; })[0];
+    if (!atual) throw generico;
+    if (!ok) {
+      atual.tentativas = (atual.tentativas || 0) + 1;
+      if (atual.tentativas >= CFG.MAX_TENTATIVAS) {
+        atual.bloqueadoAte = agora + CFG.BLOQUEIO_MS;
+        atual.tentativas = 0;
+      }
+      atualizar('Usuarios', atual._linha, atual);
+      throw generico;
+    }
+    atual.tentativas = 0;
+    atual.bloqueadoAte = 0;
+    if (novoHash && atual.hashSenha === u.hashSenha) atual.hashSenha = novoHash;
+    atualizar('Usuarios', atual._linha, atual);
+    limparSessoesExpiradas(agora);
+    var token = criarSessaoInterna(atual.id, agora);
+    return { token: token, usuario: usuarioPublico(atual) };
+  });
+}
+
+function logout(d) {
+  if (typeof d.token !== 'string') return { saiu: true };
+  var th = sha256Hex('sessao|' + d.token);
+  return comLock(function () {
+    var s = lerTabela('Sessoes').filter(function (x) { return x.tokenHash === th; })[0];
+    if (s) removerLinha('Sessoes', s._linha);
+    return { saiu: true };
+  });
+}
+
+
+// ======================= backend/src/04_boloes.js =======================
+// ===== Bolões (administrador) =====
+/** Uma cota ocupa vaga se não expirou e, antes do pagamento, teve atividade nas últimas 48h. */
+function cotaOcupaVaga(c, agora) {
+  if (c.status === 'expirada') return false;
+  if (c.status === 'rascunho' || c.status === 'completa') {
+    return (agora - (c.atualizadoEm || c.criadoEm || 0)) <= CFG.COTA_ABANDONO_MS;
+  }
+  return true;
+}
+
+function cotasAtivasDoBolao(bolaoId) {
+  var agora = RELOGIO.agora();
+  return lerTabela('Cotas').filter(function (c) { return c.bolaoId === bolaoId && cotaOcupaVaga(c, agora); });
+}
+
+function bolaoParaSaida(b, ocupadas) {
+  var mod = Regras.obterModalidade(b.modalidade);
+  return {
+    id: b.id, nome: b.nome, modalidade: b.modalidade, modalidadeNome: mod ? mod.nome : b.modalidade,
+    qtdNumeros: b.qtdNumeros, valorCotaCentavos: b.valorCotaCentavos, jogosPorCota: b.jogosPorCota,
+    limiteCotas: b.limiteCotas, maxCotasPorPessoa: b.maxCotasPorPessoa, prazo: b.prazo, status: b.status,
+    concurso: b.concurso || 0, registradoEm: b.registradoEm || 0,
+    cotasOcupadas: ocupadas, vagas: Math.max(0, b.limiteCotas - ocupadas)
+  };
+}
+
+function validarConfigCompleta(cfg, agora) {
+  var v = Regras.validarBolao(cfg);
+  var erros = v.erros.slice();
+  if (!Number.isInteger(cfg.maxCotasPorPessoa) || cfg.maxCotasPorPessoa < 1) {
+    erros.push('Máximo de cotas por pessoa deve ser um inteiro maior ou igual a 1.');
+  } else if (Number.isInteger(cfg.limiteCotas) && cfg.maxCotasPorPessoa > cfg.limiteCotas) {
+    erros.push('Máximo de cotas por pessoa não pode passar do limite de cotas.');
+  }
+  if (!Number.isInteger(cfg.prazo) || cfg.prazo <= agora) erros.push('O prazo deve ser uma data futura.');
+  if (erros.length) throw erroNegocio(erros.join(' '));
+}
+
+function criarBolao(admin, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var cfg = {
+      nome: limparTexto(d.nome, 60), modalidade: String(d.modalidade || ''), qtdNumeros: d.qtdNumeros,
+      valorCotaCentavos: d.valorCotaCentavos, jogosPorCota: d.jogosPorCota, limiteCotas: d.limiteCotas,
+      maxCotasPorPessoa: (d.maxCotasPorPessoa === undefined ? 1 : d.maxCotasPorPessoa), prazo: d.prazo
+    };
+    validarConfigCompleta(cfg, agora);
+    cfg.id = novoId();
+    cfg.status = 'rascunho';
+    cfg.criadoPor = admin.id;
+    cfg.criadoEm = agora;
+    cfg.atualizadoEm = agora;
+    inserir('Boloes', cfg);
+    return bolaoParaSaida(cfg, 0);
+  });
+}
+
+function achaBolao(id) {
+  var b = lerTabela('Boloes').filter(function (x) { return x.id === id; })[0];
+  if (!b) throw erroNegocio('Bolão não encontrado.');
+  return b;
+}
+
+var CAMPOS_BLOQUEADOS_COM_COTAS = ['modalidade', 'qtdNumeros', 'valorCotaCentavos', 'jogosPorCota', 'limiteCotas', 'maxCotasPorPessoa'];
+
+function editarBolao(d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var b = achaBolao(d.id);
+    if (b.status === 'arquivado' || b.status === 'fechado') throw erroNegocio('Este bolão não pode mais ser editado.');
+    var ocupadas = cotasAtivasDoBolao(b.id).length;
+
+    var novo = {};
+    var k;
+    for (k in b) if (Object.prototype.hasOwnProperty.call(b, k)) novo[k] = b[k];
+
+    if (ocupadas > 0) {
+      for (var i = 0; i < CAMPOS_BLOQUEADOS_COM_COTAS.length; i++) {
+        var f = CAMPOS_BLOQUEADOS_COM_COTAS[i];
+        if (d[f] !== undefined && d[f] !== b[f]) {
+          throw erroNegocio('Este bolão já tem cotas: só o nome e o prazo podem ser alterados.');
+        }
+      }
+    } else {
+      for (var j = 0; j < CAMPOS_BLOQUEADOS_COM_COTAS.length; j++) {
+        var g = CAMPOS_BLOQUEADOS_COM_COTAS[j];
+        if (d[g] !== undefined) novo[g] = d[g];
+      }
+    }
+    if (d.nome !== undefined) novo.nome = limparTexto(d.nome, 60);
+    if (d.prazo !== undefined) novo.prazo = d.prazo;
+
+    validarConfigCompleta(novo, agora);
+    novo.atualizadoEm = agora;
+    atualizar('Boloes', b._linha, novo);
+    return bolaoParaSaida(novo, ocupadas);
+  });
+}
+
+function alterarStatusBolao(d) {
+  return comLock(function () {
+    var b = achaBolao(d.id);
+    var ocupadas = cotasAtivasDoBolao(b.id).length;
+    var para = d.status;
+    var permitido = (b.status === 'rascunho' && para === 'aberto') || (b.status === 'aberto' && para === 'rascunho');
+    if (!permitido) throw erroNegocio('Mudança de status não permitida.');
+    if (para === 'rascunho' && ocupadas > 0) throw erroNegocio('Não é possível voltar a rascunho: já existem cotas.');
+    if (para === 'aberto' && b.prazo <= RELOGIO.agora()) throw erroNegocio('O prazo já passou. Edite o prazo antes de abrir.');
+    b.status = para;
+    b.atualizadoEm = RELOGIO.agora();
+    atualizar('Boloes', b._linha, b);
+    return bolaoParaSaida(b, ocupadas);
+  });
+}
+
+/** Sem cotas: apaga de verdade. Com cotas: arquiva, preservando o histórico. */
+function excluirBolao(d) {
+  return comLock(function () {
+    var b = achaBolao(d.id);
+    var todasCotas = lerTabela('Cotas').filter(function (c) { return c.bolaoId === b.id; });
+    if (todasCotas.length === 0) {
+      removerLinha('Boloes', b._linha);
+      return { id: b.id, removido: true, arquivado: false };
+    }
+    b.status = 'arquivado';
+    b.atualizadoEm = RELOGIO.agora();
+    atualizar('Boloes', b._linha, b);
+    return { id: b.id, removido: false, arquivado: true };
+  });
+}
+
+function listarBoloesAdmin(d) {
+  var agora = RELOGIO.agora();
+  var todas = lerTabela('Cotas');
+  return lerTabela('Boloes')
+    .filter(function (b) { return d.incluirArquivados || b.status !== 'arquivado'; })
+    .map(function (b) {
+      var n = todas.filter(function (c) { return c.bolaoId === b.id && cotaOcupaVaga(c, agora); }).length;
+      var saida = bolaoParaSaida(b, n);
+      saida.confirmadas = todas.filter(function (c) { return c.bolaoId === b.id && c.status === 'confirmada'; }).length;
+      saida.aguardando = todas.filter(function (c) { return c.bolaoId === b.id && c.status === 'aguardando_pagamento'; }).length;
+      return saida;
+    });
+}
+
+function boloesAbertos() {
+  var agora = RELOGIO.agora();
+  var todas = lerTabela('Cotas');
+  return lerTabela('Boloes')
+    .filter(function (b) { return b.status === 'aberto'; })
+    .map(function (b) {
+      var n = todas.filter(function (c) { return c.bolaoId === b.id && cotaOcupaVaga(c, agora); }).length;
+      return bolaoParaSaida(b, n);
+    });
+}
+
+function modalidadesDisponiveis() {
+  return Object.keys(Regras.MODALIDADES).map(function (id) {
+    var m = Regras.MODALIDADES[id];
+    return { id: id, nome: m.nome, minimo: m.minimo, maximo: m.maximo, dezenasMin: m.dezenasMin, dezenasMax: m.dezenasMax, sorteados: m.sorteados };
+  });
+}
+
+
+// ======================= backend/src/05_api.js =======================
+// ===== API HTTP (doGet/doPost) =====
+var ACOES = {
+  'cadastrar':             { nivel: 'publico', fn: function (d) { return cadastrar(d); } },
+  'login':                 { nivel: 'publico', fn: function (d) { return login(d); } },
+  'logout':                { nivel: 'publico', fn: function (d) { return logout(d); } },
+  'eu':                    { nivel: 'usuario', fn: function (d, u) { return usuarioPublico(u); } },
+  'modalidades':           { nivel: 'usuario', fn: function () { return modalidadesDisponiveis(); } },
+  'boloes.abertos':        { nivel: 'usuario', fn: function () { return boloesAbertos(); } },
+  'publico.config':        { nivel: 'publico', fn: function () { return configPublica(); } },
+  'publico.jogos':         { nivel: 'publico', fn: function () { return paginaPublica(); } },
+  'publico.loterias':      { nivel: 'publico', fn: function () { return loteriasPublicas(); } },
+  'imagem.obter':          { nivel: 'publico', fn: function (d) { return obterImagem(d); } },
+  'jogos.salvarVarios':    { nivel: 'usuario', fn: function (d, u) { return salvarJogosLote(u, d); } },
+  'cotas.gerarPix':        { nivel: 'usuario', fn: function (d, u) { return gerarPixCota(u, d); } },
+  'cotas.pix':             { nivel: 'usuario', fn: function (d, u) { return pixDaMinhaCota(u, d); } },
+  'cotas.minhas':          { nivel: 'usuario', fn: function (d, u) { return minhasCotas(u); } },
+  'cotas.criar':           { nivel: 'usuario', fn: function (d, u) { return criarCota(u, d); } },
+  'cotas.cancelar':        { nivel: 'usuario', fn: function (d, u) { return cancelarCota(u, d); } },
+  'jogos.salvar':          { nivel: 'usuario', fn: function (d, u) { return salvarJogo(u, d); } },
+  'jogos.remover':         { nivel: 'usuario', fn: function (d, u) { return removerJogo(u, d); } },
+  'admin.cotas.listar':    { nivel: 'admin',   fn: function (d) { return listarCotasAdmin(d); } },
+  'admin.cotas.aprovar':   { nivel: 'admin',   fn: function (d) { return aprovarCota(d); } },
+  'admin.cotas.reprovar':  { nivel: 'admin',   fn: function (d) { return reprovarCota(d); } },
+  'admin.auditoria.resumo':   { nivel: 'admin', fn: function () { return resumoAuditoria(); } },
+  'admin.auditoria.comprovante': { nivel: 'admin', fn: function (d) { return enviarComprovante(d); } },
+  'admin.auditoria.removerEntrada': { nivel: 'admin', fn: function (d) { return removerEntradaAuditoria(d); } },
+  'admin.auditoria.jogos':    { nivel: 'admin', fn: function (d) { return salvarJogosRegistrados(d); } },
+  'admin.auditoria.registrar': { nivel: 'admin', fn: function (d) { return registrarBolao(d); } },
+  'admin.auditoria.desregistrar': { nivel: 'admin', fn: function (d) { return desregistrarBolao(d); } },
+  'admin.conferencia.consultar': { nivel: 'admin', fn: function (d) { return consultarConferencia(d); } },
+  'admin.conferencia.historico': { nivel: 'admin', fn: function () { return historicoConferencias(); } },
+  'admin.limpeza.previa':  { nivel: 'admin',   fn: function () { return contagemLimpeza(); } },
+  'admin.limpeza.executar': { nivel: 'admin',  fn: function (d) { return limparTudo(d); } },
+  // nivel 'ads' = administrador principal ou administrador de propagandas
+  'admin.config.obter':    { nivel: 'ads',     fn: function (d, u) { return configParaPapel(u, configParaAdmin()); } },
+  'admin.config.salvar':   { nivel: 'ads',     fn: function (d, u) { restringirPublicidade(u, d, ['pix', 'topo', 'carrossel']); return configParaPapel(u, salvarConfig(d)); } },
+  'admin.loterias.testar': { nivel: 'ads',     fn: function (d) { return testarFonteLoterias(d); } },
+  'admin.imagem.enviar':   { nivel: 'ads',     fn: function (d, u) { exigirUsoSlot(u, d.uso); return configParaPapel(u, enviarImagem(d)); } },
+  'admin.imagem.remover':  { nivel: 'ads',     fn: function (d, u) { exigirUsoSlot(u, d.uso); return configParaPapel(u, removerImagemUso(d)); } },
+  'admin.contagem.salvar': { nivel: 'ads',     fn: function (d) { return salvarContagem(d); } },
+  'publico.contagem':      { nivel: 'publico', fn: function () { return lerContagem(); } },
+  'admin.usuarios.listar': { nivel: 'admin',   fn: function () { return listarUsuarios(); } },
+  'admin.usuarios.redefinir': { nivel: 'admin', fn: function (d, u) { return redefinirUsuario(u, d); } },
+  'admin.banners.atualizar': { nivel: 'admin', fn: function (d) { return atualizarBanner(d); } },
+  'admin.banners.mover':   { nivel: 'admin',   fn: function (d) { return moverBanner(d); } },
+  'admin.banners.remover': { nivel: 'admin',   fn: function (d) { return removerBanner(d); } },
+  'admin.convites.criar':  { nivel: 'admin',   fn: function (d, u) { return criarConvite(u, d); } },
+  'admin.convites.listar': { nivel: 'admin',   fn: function () { return listarConvites(); } },
+  'admin.convites.revogar': { nivel: 'admin',  fn: function (d) { return revogarConvite(d); } },
+  'admin.boloes.listar':   { nivel: 'admin',   fn: function (d) { return listarBoloesAdmin(d); } },
+  'admin.boloes.criar':    { nivel: 'admin',   fn: function (d, u) { return criarBolao(u, d); } },
+  'admin.boloes.editar':   { nivel: 'admin',   fn: function (d) { return editarBolao(d); } },
+  'admin.boloes.status':   { nivel: 'admin',   fn: function (d) { return alterarStatusBolao(d); } },
+  'admin.boloes.excluir':  { nivel: 'admin',   fn: function (d) { return excluirBolao(d); } }
+};
+
+function despachar(corpo) {
+  try {
+    if (!corpo || typeof corpo !== 'object' || Array.isArray(corpo)) throw erroNegocio('Requisição inválida.');
+    var def = Object.prototype.hasOwnProperty.call(ACOES, corpo.acao) ? ACOES[corpo.acao] : null;
+    if (!def) throw erroNegocio('Ação desconhecida.');
+    var usuario = null;
+    if (def.nivel === 'usuario') usuario = autenticar(corpo.token);
+    if (def.nivel === 'admin') usuario = exigirAdmin(corpo.token);
+    if (def.nivel === 'ads') usuario = exigirAdminOuPublicidade(corpo.token);
+    return { ok: true, dados: def.fn(corpo, usuario), agora: RELOGIO.agora() };
+  } catch (err) {
+    if (err && err.negocio) return { ok: false, erro: err.message };
+    console.error('Erro interno: ' + (err && err.stack ? err.stack : err));
+    return { ok: false, erro: 'Erro interno. Tente novamente.' };
+  }
+}
+
+function responder(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  var corpo = null;
+  try {
+    corpo = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return responder({ ok: false, erro: 'Requisição inválida.' });
+  }
+  return responder(despachar(corpo));
+}
+
+var VERSAO_API = '10';
+
+/** Abrir a URL /exec no navegador mostra a versão do código que está realmente publicada. */
+function doGet() {
+  return responder({ ok: true, servico: 'bolao-api', versao: VERSAO_API });
+}
+
+
+// ======================= backend/src/06_setup.js =======================
+// ===== Funções para rodar manualmente no editor do Apps Script =====
+
+/** Passo 1: cria as abas e guarda o ID da planilha. Pode ser executada de novo sem perder dados. */
+function configurar() {
+  var ss = SpreadsheetApp.getActive();
+  props().setProperty('PLANILHA_ID', ss.getId());
+  var nomes = Object.keys(CFG.ABAS);
+  for (var i = 0; i < nomes.length; i++) {
+    var nome = nomes[i];
+    var cols = CFG.ABAS[nome];
+    var sh = ss.getSheetByName(nome) || ss.insertSheet(nome);
+    sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  Logger.log('Configuração concluída. Abas: ' + nomes.join(', '));
+}
+
+/** Passo 2: gera o código de convite do primeiro administrador (aparece no registro de execução). */
+function primeiroAdmin() {
+  var admins = lerTabela('Usuarios').filter(function (u) { return u.papel === 'admin'; });
+  if (admins.length > 0) {
+    Logger.log('Já existe um administrador cadastrado. Nada foi criado.');
+    return;
+  }
+  var conv = comLock(function () { return criarConviteInterno('admin', 'sistema', CFG.CONVITE_HORAS_PADRAO); });
+  Logger.log('CÓDIGO DO PRIMEIRO ADMINISTRADOR (uso único, válido por ' + CFG.CONVITE_HORAS_PADRAO + 'h): ' + conv.codigo);
+}
+
+/** Passo 3: confere no seu ambiente real o que a simulação local não consegue provar. */
+function testeRapido() {
+  var falhas = [];
+  var ss = planilha();
+
+  // 1) Textos que o Planilhas costuma converter precisam voltar iguais (usa a mesma codificação do sistema).
+  var amostras = ['12e4', '0123', '1-2-3', 'TRUE', '1,5', '12:30', '31/12/2026', '1/2', '=1+1', '2003', 'Maria Silva'];
+  var tmp = ss.getSheetByName('_teste') || ss.insertSheet('_teste');
+  try {
+    tmp.clear();
+    var linhaA = amostras.map(codificarTexto);
+    linhaA.push(1700000000000);
+    tmp.appendRow(linhaA);                                              // gravação por appendRow
+    tmp.getRange(2, 1, 1, linhaA.length).setValues([linhaA]);           // gravação por setValues
+    var lidas = tmp.getRange(1, 1, 2, linhaA.length).getValues();
+    for (var r = 0; r < 2; r++) {
+      for (var i = 0; i < amostras.length; i++) {
+        var volta = decodificarTexto(lidas[r][i]);
+        if (volta !== amostras[i]) falhas.push('linha ' + (r + 1) + ': "' + amostras[i] + '" voltou como "' + volta + '"');
+      }
+      if (Number(lidas[r][amostras.length]) !== 1700000000000) falhas.push('número grande voltou como ' + lidas[r][amostras.length]);
+    }
+  } finally {
+    ss.deleteSheet(tmp);
+  }
+
+  // 1b) Células grandes (as imagens ficam na planilha em partes de 30 mil caracteres) precisam voltar inteiras.
+  var tmp2 = ss.getSheetByName('_teste2') || ss.insertSheet('_teste2');
+  try {
+    tmp2.clear();
+    var parte = 'iVBORw0KGgo' + new Array(CFG.IMG_PARTE - 10).join('A');
+    var celula = codificarTexto(parte);
+    tmp2.getRange(1, 1, 3, 2).setValues([[celula, 1], [celula, 2], [celula, 3]]);
+    var volta2 = tmp2.getRange(1, 1, 3, 2).getValues();
+    for (var q = 0; q < 3; q++) {
+      if (decodificarTexto(volta2[q][0]) !== parte) falhas.push('célula grande voltou diferente (' + String(volta2[q][0]).length + ' caracteres)');
+      if (Number(volta2[q][1]) !== q + 1) falhas.push('número ao lado da célula grande voltou como ' + volta2[q][1]);
+    }
+  } finally {
+    ss.deleteSheet(tmp2);
+  }
+
+  // 2) Velocidade do hash de senha.
+  var iter = iteracoesHash();
+  var t0 = Date.now();
+  var reg = hashSenha('senha-de-teste', iter);
+  var ms = Date.now() - t0;
+  if (!verificarSenha('senha-de-teste', reg)) falhas.push('verificação de senha falhou');
+  if (verificarSenha('outra-senha', reg)) falhas.push('senha errada foi aceita');
+  Logger.log('Hash de senha: ' + iter + ' iterações em ' + ms + ' ms.');
+  if (ms > 3000) falhas.push('hash lento demais (' + ms + ' ms): reduza HASH_ITER nas Propriedades do Script');
+
+  // 3) Lock.
+  try {
+    comLock(function () { return true; });
+  } catch (e) {
+    falhas.push('LockService: ' + e);
+  }
+
+  if (falhas.length === 0) Logger.log('TESTE RÁPIDO: TUDO OK.');
+  else Logger.log('TESTE RÁPIDO: FALHOU -> ' + falhas.join(' | '));
+}
+
+
+// ======================= backend/src/07_cotas.js =======================
+// ===== Cotas e jogos (participante) =====
+function textoParaNumeros(t) {
+  return String(t).split('-').filter(function (x) { return x !== ''; }).map(Number);
+}
+
+function cotaParaSaida(c, jogosDaCota) {
+  var ordenados = jogosDaCota.slice().sort(function (a, b) { return (a.criadoEm || 0) - (b.criadoEm || 0); });
+  return {
+    id: c.id, bolaoId: c.bolaoId, status: c.status, observacao: c.observacao || '',
+    pixGeradoEm: c.pixGeradoEm || 0, confirmadaEm: c.confirmadaEm || 0,
+    jogos: ordenados.map(function (j) { return { id: j.id, numeros: textoParaNumeros(j.numeros) }; })
+  };
+}
+
+/** Só o dono acessa a cota. Cota abandonada há mais de 48h é encerrada aqui (chamar dentro de comLock). */
+function minhaCotaOuErro(u, cotaId, agora) {
+  var c = lerTabela('Cotas').filter(function (x) { return x.id === cotaId && x.userId === u.id && x.status !== 'expirada'; })[0];
+  if (!c) throw erroNegocio('Cota não encontrada.');
+  if (!cotaOcupaVaga(c, agora)) {
+    c.status = 'expirada';
+    atualizar('Cotas', c._linha, c);
+    throw erroNegocio('Esta cota expirou por inatividade. Inicie uma nova.');
+  }
+  return c;
+}
+
+function exigirEditavel(c, b, agora) {
+  if (b.status !== 'aberto') throw erroNegocio('Este bolão não está aberto para alterações.');
+  if (b.prazo <= agora) throw erroNegocio('O prazo deste bolão terminou.');
+  if (c.status !== 'rascunho' && c.status !== 'completa') throw erroNegocio('Esta cota não pode mais ser alterada.');
+}
+
+function reavaliarStatus(c, b, qtdJogos, agora) {
+  var novo = (qtdJogos === b.jogosPorCota) ? 'completa' : 'rascunho';
+  if (novo !== c.status && Rateio.podeTransitar(c.status, novo)) c.status = novo;
+  c.atualizadoEm = agora;
+  atualizar('Cotas', c._linha, c);
+}
+
+function minhasCotas(u) {
+  var agora = RELOGIO.agora();
+  var jogos = lerTabela('Jogos');
+  return lerTabela('Cotas')
+    .filter(function (c) { return c.userId === u.id && cotaOcupaVaga(c, agora); })
+    .map(function (c) { return cotaParaSaida(c, jogos.filter(function (j) { return j.cotaId === c.id; })); });
+}
+
+function criarCota(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var b = achaBolao(d.bolaoId);
+    if (b.status !== 'aberto') throw erroNegocio('Este bolão não está aberto.');
+    if (b.prazo <= agora) throw erroNegocio('O prazo deste bolão terminou.');
+    var ocupadas = lerTabela('Cotas').filter(function (c) { return c.bolaoId === b.id && cotaOcupaVaga(c, agora); });
+    if (ocupadas.length >= b.limiteCotas) throw erroNegocio('Todas as cotas deste bolão já foram preenchidas.');
+    var minhas = ocupadas.filter(function (c) { return c.userId === u.id; });
+    if (minhas.length >= b.maxCotasPorPessoa) throw erroNegocio('Você já atingiu o máximo de cotas deste bolão.');
+    var c = { id: novoId(), bolaoId: b.id, userId: u.id, status: 'rascunho', criadoEm: agora, atualizadoEm: agora, confirmadaEm: '' };
+    inserir('Cotas', c);
+    return cotaParaSaida(c, []);
+  });
+}
+
+function salvarJogo(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = minhaCotaOuErro(u, d.cotaId, agora);
+    var b = achaBolao(c.bolaoId);
+    exigirEditavel(c, b, agora);
+    var v = Regras.validarJogo(d.numeros, b);
+    if (!v.ok) throw erroNegocio(v.erros.join(' '));
+    var chave = Regras.chaveJogo(v.numeros);
+    var jogos = lerTabela('Jogos').filter(function (j) { return j.cotaId === c.id; });
+
+    var alvo = null;
+    if (d.jogoId !== undefined && d.jogoId !== null) {
+      alvo = jogos.filter(function (j) { return j.id === d.jogoId; })[0];
+      if (!alvo) throw erroNegocio('Jogo não encontrado.');
+    } else if (jogos.length >= b.jogosPorCota) {
+      throw erroNegocio('Sua cota já tem todos os ' + b.jogosPorCota + ' jogos.');
+    }
+    var repetido = jogos.some(function (j) {
+      return (!alvo || j.id !== alvo.id) && Regras.chaveJogo(textoParaNumeros(j.numeros)) === chave;
+    });
+    if (repetido) throw erroNegocio('Este jogo já está na sua cota.');
+
+    if (alvo) {
+      alvo.numeros = chave;
+      atualizar('Jogos', alvo._linha, alvo);
+    } else {
+      var novo = { id: novoId(), cotaId: c.id, numeros: chave, criadoEm: agora };
+      inserir('Jogos', novo);
+      jogos.push(novo);
+    }
+    reavaliarStatus(c, b, jogos.length, agora);
+    return cotaParaSaida(c, jogos);
+  });
+}
+
+/** Vários jogos de uma vez (uma leitura, um bloco de escrita): tudo ou nada. */
+function salvarJogosLote(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = minhaCotaOuErro(u, d.cotaId, agora);
+    var b = achaBolao(c.bolaoId);
+    exigirEditavel(c, b, agora);
+    if (!Array.isArray(d.jogos) || d.jogos.length === 0) throw erroNegocio('Nenhum jogo para salvar.');
+    var jogos = lerTabela('Jogos').filter(function (j) { return j.cotaId === c.id; });
+    if (jogos.length + d.jogos.length > b.jogosPorCota) {
+      throw erroNegocio('A cota aceita no máximo ' + b.jogosPorCota + ' jogos (já tem ' + jogos.length + ').');
+    }
+    var chaves = {};
+    jogos.forEach(function (j) { chaves[Regras.chaveJogo(textoParaNumeros(j.numeros))] = true; });
+    var novos = [];
+    d.jogos.forEach(function (numeros, i) {
+      var v = Regras.validarJogo(numeros, b);
+      if (!v.ok) throw erroNegocio('Jogo ' + (jogos.length + i + 1) + ': ' + v.erros.join(' '));
+      var chave = Regras.chaveJogo(v.numeros);
+      if (chaves[chave]) throw erroNegocio('Jogo ' + (jogos.length + i + 1) + ' repetido na sua cota.');
+      chaves[chave] = true;
+      novos.push({ id: novoId(), cotaId: c.id, numeros: chave, criadoEm: agora });
+    });
+    var sh = aba('Jogos');
+    var linhas = novos.map(function (j) { return linhaDe('Jogos', j); });
+    sh.getRange(sh.getLastRow() + 1, 1, linhas.length, linhas[0].length).setValues(linhas);
+    var todos = jogos.concat(novos);
+    reavaliarStatus(c, b, todos.length, agora);
+    return cotaParaSaida(c, todos);
+  });
+}
+
+function removerJogo(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = minhaCotaOuErro(u, d.cotaId, agora);
+    var b = achaBolao(c.bolaoId);
+    exigirEditavel(c, b, agora);
+    var jogos = lerTabela('Jogos').filter(function (j) { return j.cotaId === c.id; });
+    var alvo = jogos.filter(function (j) { return j.id === d.jogoId; })[0];
+    if (!alvo) throw erroNegocio('Jogo não encontrado.');
+    removerLinha('Jogos', alvo._linha);
+    var restantes = jogos.filter(function (j) { return j.id !== alvo.id; });
+    reavaliarStatus(c, b, restantes.length, agora);
+    return cotaParaSaida(c, restantes);
+  });
+}
+
+/** Desistir da cota antes do pagamento: libera a vaga e apaga os jogos. */
+function cancelarCota(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = minhaCotaOuErro(u, d.cotaId, agora);
+    if (c.status !== 'rascunho' && c.status !== 'completa') throw erroNegocio('Esta cota não pode mais ser cancelada por aqui.');
+    var jogos = lerTabela('Jogos').filter(function (j) { return j.cotaId === c.id; });
+    jogos.sort(function (a, b) { return b._linha - a._linha; }); // de baixo para cima, para não deslocar as linhas
+    jogos.forEach(function (j) { removerLinha('Jogos', j._linha); });
+    c.status = 'expirada';
+    c.atualizadoEm = agora;
+    atualizar('Cotas', c._linha, c);
+    return { id: c.id, cancelada: true };
+  });
+}
+
+
+// ======================= backend/src/08_config.js =======================
+// ===== Configurações do administrador: PIX, banner do topo, carrossel =====
+function lerConfig() {
+  var o = {};
+  lerTabela('Config').forEach(function (r) { o[r.chave] = r.valor; });
+  return o;
+}
+
+/** Chamar dentro de comLock. */
+function gravarConfig(pares) {
+  var t = lerTabela('Config');
+  Object.keys(pares).forEach(function (k) {
+    var ex = t.filter(function (r) { return r.chave === k; })[0];
+    if (ex) { ex.valor = String(pares[k]); atualizar('Config', ex._linha, ex); }
+    else inserir('Config', { chave: k, valor: String(pares[k]) });
+  });
+}
+
+function segundosCarrossel(c) {
+  var n = Number(c['carrossel.segundos']);
+  return (n >= 2 && n <= 30) ? n : 6;
+}
+
+function validarLink(l) {
+  l = String(l === undefined || l === null ? '' : l).trim();
+  if (l === '') return '';
+  if (!/^https:\/\/[^\s]+$/i.test(l) || l.length > 300) throw erroNegocio('O link deve começar com https:// e não ter espaços.');
+  return l;
+}
+
+// Espaços de propaganda do site (o banner do topo e o carrossel têm telas próprias).
+var SLOT_NOMES = ['navbar', 'lateral', 'rodape', 'cabecalho', 'menu', 'meio', 'lateral_esq'];
+var SLOT_TIPOS = ['', 'imagem', 'codigo'];
+var SLOT_CODIGO_MAX = 6000;
+
+function lerSlots(c, publico) {
+  var out = {};
+  SLOT_NOMES.forEach(function (n) {
+    var p = 'slot.' + n + '.';
+    var tipo = SLOT_TIPOS.indexOf(c[p + 'tipo']) === -1 ? '' : (c[p + 'tipo'] || '');
+    var s = { tipo: tipo, imagemId: c[p + 'imagemId'] || '', link: c[p + 'link'] || '', codigo: c[p + 'codigo'] || '' };
+    if (publico) {
+      // o público só recebe o que está em uso
+      s = { tipo: tipo, imagemId: tipo === 'imagem' ? s.imagemId : '', link: tipo === 'imagem' ? s.link : '', codigo: tipo === 'codigo' ? s.codigo : '' };
+    }
+    out[n] = s;
+  });
+  return out;
+}
+
+function listarBanners(soAtivos) {
+  return lerTabela('Banners')
+    .filter(function (b) { return !soAtivos || b.ativo === 1; })
+    .sort(function (a, b) { return a.ordem - b.ordem; })
+    .map(function (b) { return { id: b.id, imagemId: b.imagemId, titulo: b.titulo, link: b.link, ativo: b.ativo === 1, ordem: b.ordem }; });
+}
+
+function configParaAdmin() {
+  var c = lerConfig();
+  return {
+    pix: { chave: c['pix.chave'] || '', nome: c['pix.nome'] || '', cidade: c['pix.cidade'] || '', instrucoes: c['pix.instrucoes'] || '', qrImagemId: c['pix.qrImagemId'] || '' },
+    topo: { imagemId: c['topo.imagemId'] || '', link: c['topo.link'] || '' },
+    carrossel: { segundos: segundosCarrossel(c), incluirBoloes: c['carrossel.incluirBoloes'] !== '0' },
+    slots: lerSlots(c, false),
+    loterias: { ativo: c['loterias.ativo'] !== '0', apiBase: c['loterias.apiBase'] || '', apiPadrao: LOTERIAS_BASE_PADRAO },
+    banners: listarBanners(false)
+  };
+}
+
+/** Só o que o público pode ver: nada de chave PIX. */
+function configPublica() {
+  var c = lerConfig();
+  return {
+    topo: { imagemId: c['topo.imagemId'] || '', link: c['topo.link'] || '' },
+    carrossel: { segundos: segundosCarrossel(c), incluirBoloes: c['carrossel.incluirBoloes'] !== '0' },
+    slots: lerSlots(c, true),
+    loterias: { ativo: c['loterias.ativo'] !== '0' },
+    banners: listarBanners(true).map(function (b) { return { id: b.id, imagemId: b.imagemId, titulo: b.titulo, link: b.link }; })
+  };
+}
+
+function salvarConfig(d) {
+  return comLock(function () {
+    var pares = {};
+    if (d.pix !== undefined) {
+      var p = d.pix || {};
+      var chave = String(p.chave === undefined || p.chave === null ? '' : p.chave).trim();
+      var nome = limparTexto(p.nome, 60);
+      var cidade = limparTexto(p.cidade, 30);
+      var instr = limparTexto(p.instrucoes, 300);
+      if (chave.length > 140) throw erroNegocio('Chave PIX muito longa.');
+      if (chave !== '') {
+        if (!nome || !cidade) throw erroNegocio('Com a chave PIX, informe também o nome do recebedor e a cidade.');
+        try {
+          Pix.gerarPix({ chave: chave, nomeRecebedor: nome, cidade: cidade, valorCentavos: 100 });
+        } catch (e) {
+          throw erroNegocio('Dados do PIX inválidos: ' + e.message);
+        }
+      }
+      pares['pix.chave'] = chave; pares['pix.nome'] = nome; pares['pix.cidade'] = cidade; pares['pix.instrucoes'] = instr;
+    }
+    if (d.topo !== undefined) pares['topo.link'] = validarLink((d.topo || {}).link);
+    if (d.carrossel !== undefined) {
+      var cr = d.carrossel || {};
+      if (cr.segundos !== undefined) {
+        if (!Number.isInteger(cr.segundos) || cr.segundos < 2 || cr.segundos > 30) throw erroNegocio('A velocidade deve ser de 2 a 30 segundos por banner.');
+        pares['carrossel.segundos'] = cr.segundos;
+      }
+      if (cr.incluirBoloes !== undefined) pares['carrossel.incluirBoloes'] = cr.incluirBoloes ? '1' : '0';
+    }
+    if (d.slots !== undefined) {
+      var sl = d.slots || {};
+      SLOT_NOMES.forEach(function (n) {
+        if (sl[n] === undefined) return;
+        var s = sl[n] || {};
+        var p = 'slot.' + n + '.';
+        if (s.tipo !== undefined) {
+          if (SLOT_TIPOS.indexOf(s.tipo) === -1) throw erroNegocio('Tipo de propaganda inválido.');
+          pares[p + 'tipo'] = s.tipo;
+        }
+        if (s.link !== undefined) pares[p + 'link'] = validarLink(s.link);
+        if (s.codigo !== undefined) {
+          var cod = String(s.codigo === null ? '' : s.codigo).replace(/\r\n/g, '\n');
+          if (cod.length > SLOT_CODIGO_MAX) throw erroNegocio('O código da propaganda passa de ' + SLOT_CODIGO_MAX + ' caracteres.');
+          pares[p + 'codigo'] = cod;
+        }
+      });
+    }
+    var mudouLoterias = false;
+    if (d.loterias !== undefined) {
+      var lo = d.loterias || {};
+      if (lo.ativo !== undefined) { pares['loterias.ativo'] = lo.ativo ? '1' : '0'; mudouLoterias = true; }
+      if (lo.apiBase !== undefined) { pares['loterias.apiBase'] = validarBaseLoterias(lo.apiBase); mudouLoterias = true; }
+    }
+    gravarConfig(pares);
+    if (mudouLoterias) limparCacheLoterias();
+    return configParaAdmin();
+  });
+}
+
+
+// ======================= backend/src/09_imagens.js =======================
+// ===== Imagens (guardadas na planilha, em partes) e banners =====
+var ASSINATURAS_IMG = { 'image/png': 'iVBORw0KGgo', 'image/jpeg': '/9j/', 'image/webp': 'UklGR' };
+
+function validarDataUrl(dataUrl) {
+  var m = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+\/]+={0,2})$/.exec(String(dataUrl === undefined || dataUrl === null ? '' : dataUrl));
+  if (!m) throw erroNegocio('Imagem inválida. Envie PNG, JPEG ou WEBP.');
+  if (m[2].length > CFG.IMG_MAX_B64) throw erroNegocio('Imagem grande demais. Use uma imagem menor.');
+  if (m[2].indexOf(ASSINATURAS_IMG[m[1]]) !== 0) throw erroNegocio('O arquivo não parece ser uma imagem válida.');
+  return { tipo: m[1], b64: m[2] };
+}
+
+/** Chamar dentro de comLock. Grava a imagem em linhas consecutivas e devolve o id. */
+function salvarImagemInterna(v, agora) {
+  var id = novoId();
+  var linhas = [];
+  for (var i = 0, parte = 0; i < v.b64.length; i += CFG.IMG_PARTE, parte++) {
+    linhas.push(linhaDe('Imagens', { id: id, parte: parte, tipo: v.tipo, dados: v.b64.substring(i, i + CFG.IMG_PARTE), criadoEm: agora }));
+  }
+  var sh = aba('Imagens');
+  sh.getRange(sh.getLastRow() + 1, 1, linhas.length, linhas[0].length).setValues(linhas);
+  return id;
+}
+
+/** Linhas (números) onde a imagem está, lendo só a coluna do id. */
+function linhasDaImagem(id) {
+  var sh = aba('Imagens');
+  var ult = sh.getLastRow();
+  var out = [];
+  if (ult < 2) return out;
+  var ids = sh.getRange(2, 1, ult - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) if (decodificarTexto(ids[i][0]) === id) out.push(i + 2);
+  return out;
+}
+
+function lerImagemDataUrl(id) {
+  var linhas = linhasDaImagem(id);
+  if (linhas.length === 0) return null;
+  var sh = aba('Imagens');
+  var ini = linhas[0];
+  var fim = linhas[linhas.length - 1];
+  var vals = sh.getRange(ini, 1, fim - ini + 1, CFG.ABAS.Imagens.length).getValues()
+    .filter(function (r) { return decodificarTexto(r[0]) === id; })
+    .sort(function (a, b) { return Number(a[1]) - Number(b[1]); });
+  var tipo = decodificarTexto(vals[0][2]);
+  var b64 = vals.map(function (r) { return decodificarTexto(r[3]); }).join('');
+  return 'data:' + tipo + ';base64,' + b64;
+}
+
+function removerImagemInterna(id) {
+  if (!id) return;
+  var linhas = linhasDaImagem(id);
+  for (var i = linhas.length - 1; i >= 0; i--) removerLinha('Imagens', linhas[i]);
+}
+
+// Onde cada "uso" de imagem fica guardado na Config.
+var USOS_IMG_CONFIG = {
+  qr: 'pix.qrImagemId', topo: 'topo.imagemId'
+};
+SLOT_NOMES.forEach(function (n) { USOS_IMG_CONFIG['slot_' + n] = 'slot.' + n + '.imagemId'; });
+
+function idsImagensPermitidas() {
+  var c = lerConfig();
+  var ids = [c['topo.imagemId'], c['pix.qrImagemId']];
+  SLOT_NOMES.forEach(function (n) { ids.push(c['slot.' + n + '.imagemId']); });
+  lerTabela('Banners').forEach(function (b) { ids.push(b.imagemId); });
+  lerTabela('Auditoria').forEach(function (e) { ids.push(e.imagemId); });
+  return ids.filter(function (x) { return !!x; });
+}
+
+/** Público para banners; a imagem do QR do PIX exige login. */
+function obterImagem(d) {
+  var naoAchou = erroNegocio('Imagem não encontrada.');
+  if (typeof d.id !== 'string' || d.id.length > 60) throw naoAchou;
+  if (idsImagensPermitidas().indexOf(d.id) === -1) throw naoAchou;
+  if (lerConfig()['pix.qrImagemId'] === d.id) autenticar(d.token);
+  if (lerTabela('Auditoria').some(function (e) { return e.imagemId === d.id; })) exigirAdmin(d.token); // comprovantes: só administrador
+  var url = lerImagemDataUrl(d.id);
+  if (!url) throw naoAchou;
+  return { dataUrl: url };
+}
+
+function enviarImagem(d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var uso = d.uso;
+    if (uso !== 'banner' && !Object.prototype.hasOwnProperty.call(USOS_IMG_CONFIG, uso)) throw erroNegocio('Uso da imagem inválido.');
+    var titulo = limparTexto(d.titulo, 80);
+    var link = validarLink(d.link);
+    var banners = lerTabela('Banners');
+    if (uso === 'banner' && banners.length >= CFG.MAX_BANNERS) throw erroNegocio('Limite de ' + CFG.MAX_BANNERS + ' banners. Remova algum antes de adicionar.');
+    var v = validarDataUrl(d.dataUrl);
+    var id = salvarImagemInterna(v, agora);
+    var c = lerConfig();
+
+    if (uso !== 'banner') {
+      var chave = USOS_IMG_CONFIG[uso];
+      var antiga = c[chave];
+      var pares = {};
+      pares[chave] = id;
+      if (uso.indexOf('slot_') === 0) { // enviar a imagem liga o espaço em modo imagem e guarda o link
+        pares['slot.' + uso.substring(5) + '.tipo'] = 'imagem';
+        if (d.link !== undefined) pares['slot.' + uso.substring(5) + '.link'] = link;
+      }
+      gravarConfig(pares);
+      if (antiga) removerImagemInterna(antiga);
+      return configParaAdmin();
+    }
+    var ordem = banners.reduce(function (m, b) { return Math.max(m, b.ordem || 0); }, 0) + 1;
+    inserir('Banners', { id: novoId(), imagemId: id, titulo: titulo, link: link, ativo: 1, ordem: ordem, criadoEm: agora });
+    return configParaAdmin();
+  });
+}
+
+function removerImagemUso(d) {
+  return comLock(function () {
+    if (!Object.prototype.hasOwnProperty.call(USOS_IMG_CONFIG, d.uso)) throw erroNegocio('Uso da imagem inválido.');
+    var chave = USOS_IMG_CONFIG[d.uso];
+    var antiga = lerConfig()[chave];
+    var pares = {};
+    pares[chave] = '';
+    gravarConfig(pares);
+    removerImagemInterna(antiga);
+    return configParaAdmin();
+  });
+}
+
+function achaBanner(id) {
+  var b = lerTabela('Banners').filter(function (x) { return x.id === id; })[0];
+  if (!b) throw erroNegocio('Banner não encontrado.');
+  return b;
+}
+
+function atualizarBanner(d) {
+  return comLock(function () {
+    var b = achaBanner(d.id);
+    if (d.titulo !== undefined) b.titulo = limparTexto(d.titulo, 80);
+    if (d.link !== undefined) b.link = validarLink(d.link);
+    if (d.ativo !== undefined) b.ativo = d.ativo ? 1 : 0;
+    atualizar('Banners', b._linha, b);
+    return configParaAdmin();
+  });
+}
+
+function moverBanner(d) {
+  return comLock(function () {
+    if (d.direcao !== 'cima' && d.direcao !== 'baixo') throw erroNegocio('Direção inválida.');
+    var todos = lerTabela('Banners').sort(function (a, b) { return a.ordem - b.ordem; });
+    var i = todos.map(function (x) { return x.id; }).indexOf(d.id);
+    if (i === -1) throw erroNegocio('Banner não encontrado.');
+    var j = d.direcao === 'cima' ? i - 1 : i + 1;
+    if (j >= 0 && j < todos.length) {
+      var oi = todos[i].ordem;
+      todos[i].ordem = todos[j].ordem;
+      todos[j].ordem = oi;
+      atualizar('Banners', todos[i]._linha, todos[i]);
+      atualizar('Banners', todos[j]._linha, todos[j]);
+    }
+    return configParaAdmin();
+  });
+}
+
+function removerBanner(d) {
+  return comLock(function () {
+    var b = achaBanner(d.id);
+    removerLinha('Banners', b._linha);
+    removerImagemInterna(b.imagemId);
+    return configParaAdmin();
+  });
+}
+
+
+// ======================= backend/src/10_pix_aprovacao.js =======================
+// ===== PIX, aprovação do administrador e página pública =====
+function pixConfigurado(cfg) {
+  return !!(cfg['pix.chave'] || cfg['pix.qrImagemId']);
+}
+
+/** Dados para o participante pagar: valor, copia e cola (se houver chave), QR (se houver) e instruções. */
+function pixDaCota(c, b) {
+  var cfg = lerConfig();
+  var copia = '';
+  if (cfg['pix.chave']) {
+    copia = Pix.gerarPix({
+      chave: cfg['pix.chave'], nomeRecebedor: cfg['pix.nome'], cidade: cfg['pix.cidade'],
+      valorCentavos: b.valorCotaCentavos, txid: 'BOLAO' + String(c.id).replace(/[^A-Za-z0-9]/g, '').toUpperCase().substring(0, 12)
+    });
+  }
+  return {
+    valorCentavos: b.valorCotaCentavos, copiaECola: copia, qrImagemId: cfg['pix.qrImagemId'] || '',
+    instrucoes: cfg['pix.instrucoes'] || '', nomeRecebedor: cfg['pix.nome'] || ''
+  };
+}
+
+function gerarPixCota(u, d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = minhaCotaOuErro(u, d.cotaId, agora);
+    var b = achaBolao(c.bolaoId);
+    if (b.status !== 'aberto') throw erroNegocio('Este bolão não está aberto.');
+    if (b.prazo <= agora) throw erroNegocio('O prazo deste bolão terminou.');
+    var jogos = lerTabela('Jogos').filter(function (j) { return j.cotaId === c.id; });
+    if (c.status !== 'completa' || jogos.length !== b.jogosPorCota) throw erroNegocio('Complete todos os ' + b.jogosPorCota + ' jogos antes de gerar o PIX.');
+    if (!pixConfigurado(lerConfig())) throw erroNegocio('O administrador ainda não configurou o PIX. Tente novamente mais tarde.');
+    if (!Rateio.podeTransitar(c.status, 'aguardando_pagamento')) throw erroNegocio('Esta cota não pode gerar PIX agora.');
+    c.status = 'aguardando_pagamento';
+    c.pixGeradoEm = agora;
+    c.atualizadoEm = agora;
+    c.observacao = '';
+    atualizar('Cotas', c._linha, c);
+    return { cota: cotaParaSaida(c, jogos), pix: pixDaCota(c, b) };
+  });
+}
+
+/** Releitura dos dados de pagamento (ao recarregar a página). */
+function pixDaMinhaCota(u, d) {
+  var c = lerTabela('Cotas').filter(function (x) { return x.id === d.cotaId && x.userId === u.id; })[0];
+  if (!c || c.status !== 'aguardando_pagamento') throw erroNegocio('Esta cota não está aguardando pagamento.');
+  return pixDaCota(c, achaBolao(c.bolaoId));
+}
+
+// ----- administrador -----
+function listarCotasAdmin(d) {
+  var filtro = Array.isArray(d.status) ? d.status : ['aguardando_pagamento', 'confirmada'];
+  var boloes = lerTabela('Boloes');
+  var usuarios = lerTabela('Usuarios');
+  var jogos = lerTabela('Jogos');
+  return lerTabela('Cotas')
+    .filter(function (c) { return filtro.indexOf(c.status) !== -1; })
+    .sort(function (a, b) { return (a.pixGeradoEm || a.criadoEm) - (b.pixGeradoEm || b.criadoEm); })
+    .map(function (c) {
+      var b = boloes.filter(function (x) { return x.id === c.bolaoId; })[0];
+      var u = usuarios.filter(function (x) { return x.id === c.userId; })[0];
+      return {
+        id: c.id, bolaoId: c.bolaoId, bolaoNome: b ? b.nome : '(bolão removido)', valorCentavos: b ? b.valorCotaCentavos : 0,
+        status: c.status, pixGeradoEm: c.pixGeradoEm || 0, confirmadaEm: c.confirmadaEm || 0,
+        usuario: u ? { usuario: u.usuario, nome: u.nome } : { usuario: '?', nome: '(removido)' },
+        jogos: jogos.filter(function (j) { return j.cotaId === c.id; })
+          .sort(function (x, y) { return (x.criadoEm || 0) - (y.criadoEm || 0); })
+          .map(function (j) { return textoParaNumeros(j.numeros); })
+      };
+    });
+}
+
+function cotaPendenteOuErro(id) {
+  var c = lerTabela('Cotas').filter(function (x) { return x.id === id; })[0];
+  if (!c) throw erroNegocio('Cota não encontrada.');
+  if (c.status !== 'aguardando_pagamento') throw erroNegocio('Esta cota não está aguardando aprovação.');
+  return c;
+}
+
+function aprovarCota(d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var c = cotaPendenteOuErro(d.cotaId);
+    if (!Rateio.podeTransitar(c.status, 'confirmada')) throw erroNegocio('Transição não permitida.');
+    c.status = 'confirmada';
+    c.confirmadaEm = agora;
+    c.atualizadoEm = agora;
+    c.observacao = '';
+    atualizar('Cotas', c._linha, c);
+    return { id: c.id, status: c.status };
+  });
+}
+
+function reprovarCota(d) {
+  return comLock(function () {
+    var motivo = limparTexto(d.motivo, 200);
+    if (motivo.length < 3) throw erroNegocio('Informe o motivo da reprovação (mínimo 3 caracteres).');
+    var agora = RELOGIO.agora();
+    var c = cotaPendenteOuErro(d.cotaId);
+    if (!Rateio.podeTransitar(c.status, 'completa')) throw erroNegocio('Transição não permitida.');
+    c.status = 'completa';
+    c.pixGeradoEm = '';
+    c.atualizadoEm = agora;
+    c.observacao = motivo;
+    atualizar('Cotas', c._linha, c);
+    return { id: c.id, status: c.status };
+  });
+}
+
+// ----- página pública -----
+function nomeAbreviado(nome) {
+  var p = String(nome).trim().split(/\s+/);
+  if (p.length < 2) return p[0] || '';
+  return p[0] + ' ' + p[p.length - 1].charAt(0).toUpperCase() + '.';
+}
+
+/** Só participantes aprovados; nome abreviado, sem usuário nem contato. */
+function paginaPublica() {
+  var cotas = lerTabela('Cotas').filter(function (c) { return c.status === 'confirmada'; });
+  var jogos = lerTabela('Jogos');
+  var usuarios = lerTabela('Usuarios');
+  return lerTabela('Boloes')
+    .filter(function (b) { return b.status === 'aberto' || b.status === 'fechado'; })
+    .map(function (b) {
+      var minhas = cotas.filter(function (c) { return c.bolaoId === b.id; })
+        .sort(function (x, y) { return (x.confirmadaEm || 0) - (y.confirmadaEm || 0); });
+      var mod = Regras.obterModalidade(b.modalidade);
+      return {
+        id: b.id, nome: b.nome, modalidade: b.modalidade, modalidadeNome: mod ? mod.nome : b.modalidade,
+        qtdNumeros: b.qtdNumeros, jogosPorCota: b.jogosPorCota, valorCotaCentavos: b.valorCotaCentavos,
+        limiteCotas: b.limiteCotas, prazo: b.prazo, status: b.status, confirmadas: minhas.length,
+        concurso: b.concurso || 0, registradoEm: b.registradoEm || 0,
+        participantes: minhas.map(function (c, idx) {
+          var u = usuarios.filter(function (x) { return x.id === c.userId; })[0];
+          var cod = sha256Hex('recibo|' + c.id).substring(0, 16).toUpperCase();
+          return {
+            nome: u ? nomeAbreviado(u.nome) : 'Participante',
+            cotaNumero: idx + 1, confirmadaEm: c.confirmadaEm || 0,
+            codigo: cod.substring(0, 4) + '-' + cod.substring(4, 8) + '-' + cod.substring(8, 12) + '-' + cod.substring(12, 16),
+            jogos: jogos.filter(function (j) { return j.cotaId === c.id; })
+              .sort(function (x, y) { return (x.criadoEm || 0) - (y.criadoEm || 0); })
+              .map(function (j) { return textoParaNumeros(j.numeros); })
+          };
+        })
+      };
+    });
+}
+
+
+// ======================= backend/src/11_auditoria.js =======================
+// ===== Auditoria (registro oficial) e conferência de resultados =====
+var LETRAS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function letraJogo(i) {
+  return i < 26 ? LETRAS.charAt(i) : LETRAS.charAt(Math.floor(i / 26) - 1) + LETRAS.charAt(i % 26);
+}
+
+function statusAuditavel(b) {
+  return b.status === 'aberto' || b.status === 'fechado';
+}
+
+/** Cotas confirmadas de um bolão, na ordem de confirmação, com nome e jogos. */
+function cotasConfirmadasDetalhe(bolaoId) {
+  var cotas = lerTabela('Cotas')
+    .filter(function (c) { return c.bolaoId === bolaoId && c.status === 'confirmada'; })
+    .sort(function (a, b) { return (a.confirmadaEm || 0) - (b.confirmadaEm || 0); });
+  var jogos = lerTabela('Jogos');
+  var usuarios = lerTabela('Usuarios');
+  return cotas.map(function (c) {
+    var u = usuarios.filter(function (x) { return x.id === c.userId; })[0];
+    return {
+      nome: u ? u.nome : '(removido)', usuario: u ? u.usuario : '?',
+      jogos: jogos.filter(function (j) { return j.cotaId === c.id; })
+        .sort(function (x, y) { return (x.criadoEm || 0) - (y.criadoEm || 0); })
+        .map(function (j) { return textoParaNumeros(j.numeros); })
+    };
+  });
+}
+
+function jogosDoSistema(detalhe) {
+  var out = [];
+  detalhe.forEach(function (d) { d.jogos.forEach(function (j) { out.push(j); }); });
+  return out;
+}
+
+function compararRegistro(b, texto, sistema) {
+  var ex = Conf.extrairJogos(texto, b.qtdNumeros, b.modalidade);
+  var cmp = Conf.compararJogos(ex.jogos, sistema);
+  return {
+    registrados: ex.jogos.length, ignoradas: ex.ignoradas.length, iguais: cmp.iguais,
+    faltamNoRegistro: cmp.faltamNoRegistro, sobramNoRegistro: cmp.sobramNoRegistro,
+    confere: ex.jogos.length > 0 && cmp.faltamNoRegistro.length === 0 && cmp.sobramNoRegistro.length === 0
+  };
+}
+
+function resumoAuditoria() {
+  var entradas = lerTabela('Auditoria');
+  return lerTabela('Boloes').filter(statusAuditavel).map(function (b) {
+    var det = cotasConfirmadasDetalhe(b.id);
+    var sistema = jogosDoSistema(det);
+    var minhas = entradas.filter(function (e) { return e.bolaoId === b.id; });
+    var txt = minhas.filter(function (e) { return e.tipo === 'jogos'; })[0];
+    var mod = Regras.obterModalidade(b.modalidade);
+    return {
+      id: b.id, nome: b.nome, modalidade: b.modalidade, modalidadeNome: mod ? mod.nome : b.modalidade, qtdNumeros: b.qtdNumeros,
+      concurso: b.concurso || 0, registradoEm: b.registradoEm || 0,
+      cotasConfirmadas: det.length, jogosNoSistema: sistema.length,
+      comprovantes: minhas.filter(function (e) { return e.tipo === 'comprovante'; })
+        .map(function (e) { return { id: e.id, imagemId: e.imagemId, criadoEm: e.criadoEm }; }),
+      textoRegistrado: txt ? txt.texto : '',
+      comparacao: txt ? compararRegistro(b, txt.texto, sistema) : null
+    };
+  });
+}
+
+function bolaoAuditavelOuErro(id) {
+  var b = achaBolao(id);
+  if (!statusAuditavel(b)) throw erroNegocio('Só bolões abertos ou fechados entram na auditoria.');
+  return b;
+}
+
+function enviarComprovante(d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var b = bolaoAuditavelOuErro(d.bolaoId);
+    var minhas = lerTabela('Auditoria').filter(function (e) { return e.bolaoId === b.id && e.tipo === 'comprovante'; });
+    if (minhas.length >= 20) throw erroNegocio('Limite de 20 comprovantes por bolão.');
+    var v = validarDataUrl(d.dataUrl);
+    var imagemId = salvarImagemInterna(v, agora);
+    inserir('Auditoria', { id: novoId(), bolaoId: b.id, tipo: 'comprovante', imagemId: imagemId, texto: '', criadoEm: agora });
+    return resumoAuditoria();
+  });
+}
+
+function removerEntradaAuditoria(d) {
+  return comLock(function () {
+    var todas = lerTabela('Auditoria');
+    var e = todas.filter(function (x) { return x.id === d.id; })[0];
+    if (!e) throw erroNegocio('Registro não encontrado.');
+    var b = achaBolao(e.bolaoId);
+    var restantes = todas.filter(function (x) { return x.bolaoId === e.bolaoId && x.id !== e.id; }).length;
+    if (b.registradoEm > 0 && restantes === 0) throw erroNegocio('Desfaça o registro oficial antes de remover o último comprovante.');
+    removerLinha('Auditoria', e._linha);
+    if (e.imagemId) removerImagemInterna(e.imagemId);
+    return resumoAuditoria();
+  });
+}
+
+function salvarJogosRegistrados(d) {
+  return comLock(function () {
+    var agora = RELOGIO.agora();
+    var b = bolaoAuditavelOuErro(d.bolaoId);
+    var texto = String(d.texto === undefined || d.texto === null ? '' : d.texto);
+    if (texto.length > 40000) throw erroNegocio('Texto grande demais (máximo de 40 mil caracteres).');
+    var atual = lerTabela('Auditoria').filter(function (e) { return e.bolaoId === b.id && e.tipo === 'jogos'; })[0];
+    if (texto.trim() === '') {
+      if (atual) {
+        var restantes = lerTabela('Auditoria').filter(function (e) { return e.bolaoId === b.id && e.id !== atual.id; }).length;
+        if (b.registradoEm > 0 && restantes === 0) throw erroNegocio('Desfaça o registro oficial antes de apagar os jogos registrados.');
+        removerLinha('Auditoria', atual._linha);
+      }
+    } else if (atual) {
+      atual.texto = texto; atual.criadoEm = agora;
+      atualizar('Auditoria', atual._linha, atual);
+    } else {
+      inserir('Auditoria', { id: novoId(), bolaoId: b.id, tipo: 'jogos', imagemId: '', texto: texto, criadoEm: agora });
+    }
+    return resumoAuditoria();
+  });
+}
+
+function registrarBolao(d) {
+  return comLock(function () {
+    var b = bolaoAuditavelOuErro(d.bolaoId);
+    if (!Number.isInteger(d.concurso) || d.concurso < 1 || d.concurso > 99999) throw erroNegocio('Informe o número do concurso (inteiro de 1 a 99999).');
+    var tem = lerTabela('Auditoria').some(function (e) { return e.bolaoId === b.id; });
+    if (!tem) throw erroNegocio('Envie ao menos um comprovante ou os jogos registrados antes de marcar o registro oficial.');
+    b.concurso = d.concurso;
+    b.registradoEm = RELOGIO.agora();
+    b.atualizadoEm = b.registradoEm;
+    atualizar('Boloes', b._linha, b);
+    return resumoAuditoria();
+  });
+}
+
+function desregistrarBolao(d) {
+  return comLock(function () {
+    var b = bolaoAuditavelOuErro(d.bolaoId);
+    b.concurso = 0;
+    b.registradoEm = 0;
+    b.atualizadoEm = RELOGIO.agora();
+    atualizar('Boloes', b._linha, b);
+    return resumoAuditoria();
+  });
+}
+
+// ----- conferência com o resultado oficial -----
+function consultarConferencia(d) {
+  return comLock(function () {
+    var mod = Regras.obterModalidade(d.modalidade);
+    if (!mod) throw erroNegocio('Modalidade desconhecida.');
+    if (!Number.isInteger(d.concurso) || d.concurso < 1 || d.concurso > 99999) throw erroNegocio('Informe o número do concurso (inteiro de 1 a 99999).');
+    var v = Conf.validarResultado(d.resultado, d.modalidade);
+    if (!v.ok) throw erroNegocio(v.erros.join(' '));
+
+    var todos = lerTabela('Boloes').filter(function (b) { return statusAuditavel(b) && b.modalidade === d.modalidade; });
+    var registrados = todos.filter(function (b) { return b.registradoEm > 0 && b.concurso === d.concurso; });
+    var naoRegistrados = todos.filter(function (b) { return !(b.registradoEm > 0 && b.concurso === d.concurso); })
+      .map(function (b) { return { nome: b.nome, registrado: b.registradoEm > 0, concurso: b.concurso || 0 }; });
+    var entradas = lerTabela('Auditoria');
+
+    var boloes = registrados.map(function (b) {
+      var det = cotasConfirmadasDetalhe(b.id);
+      var premiados = [];
+      var faixas = {};
+      var conferidos = 0;
+      var melhor = 0;
+      det.forEach(function (p) {
+        p.jogos.forEach(function (j, i) {
+          conferidos++;
+          var r = Conf.conferirJogo(j, v.numeros, b.modalidade);
+          if (r.acertos > melhor) melhor = r.acertos;
+          if (r.premios.length > 0) {
+            premiados.push({ participante: p.nome, usuario: p.usuario, letra: letraJogo(i), numeros: j, acertados: r.acertados, acertos: r.acertos, premios: r.premios });
+            r.premios.forEach(function (pr) { faixas[pr.nome] = (faixas[pr.nome] || 0) + pr.quantidade; });
+          }
+        });
+      });
+      var txt = entradas.filter(function (e) { return e.bolaoId === b.id && e.tipo === 'jogos'; })[0];
+      var divergencias = null;
+      if (txt) {
+        var cmp = compararRegistro(b, txt.texto, jogosDoSistema(det));
+        divergencias = cmp.confere ? 0 : Math.max(1, cmp.faltamNoRegistro.length + cmp.sobramNoRegistro.length);
+      }
+      return { id: b.id, nome: b.nome, cotas: det.length, jogosConferidos: conferidos, melhorAcerto: melhor, premiados: premiados, faixas: faixas, divergencias: divergencias };
+    });
+    var total = boloes.reduce(function (s, b) { return s + b.premiados.length; }, 0);
+    inserir('Conferencias', { id: novoId(), modalidade: d.modalidade, concurso: d.concurso, resultado: v.numeros.join('-'), premiados: total, criadoEm: RELOGIO.agora() });
+    return { modalidade: d.modalidade, modalidadeNome: mod.nome, concurso: d.concurso, resultado: v.numeros, boloes: boloes, naoRegistrados: naoRegistrados, totalPremiados: total };
+  });
+}
+
+function historicoConferencias() {
+  return lerTabela('Conferencias').sort(function (a, b) { return b.criadoEm - a.criadoEm; }).slice(0, 30).map(function (c) {
+    var mod = Regras.obterModalidade(c.modalidade);
+    return { id: c.id, modalidade: c.modalidade, modalidadeNome: mod ? mod.nome : c.modalidade, concurso: c.concurso, resultado: textoParaNumeros(c.resultado), premiados: c.premiados, criadoEm: c.criadoEm };
+  });
+}
+
+
+// ======================= backend/src/12_limpeza.js =======================
+// ===== Limpeza de dados de teste (apaga bolões e tudo que depende deles) =====
+function contagemLimpeza() {
+  var cotas = lerTabela('Cotas');
+  return {
+    boloes: lerTabela('Boloes').length,
+    cotas: cotas.length,
+    confirmadas: cotas.filter(function (c) { return c.status === 'confirmada'; }).length,
+    aguardando: cotas.filter(function (c) { return c.status === 'aguardando_pagamento'; }).length,
+    jogos: lerTabela('Jogos').length,
+    comprovantes: lerTabela('Auditoria').filter(function (e) { return e.tipo === 'comprovante'; }).length,
+    conferencias: lerTabela('Conferencias').length,
+    participantes: lerTabela('Usuarios').filter(function (u) { return u.papel === 'participante'; }).length
+  };
+}
+
+function apagarLinhasDaAba(nome) {
+  var sh = aba(nome);
+  var ult = sh.getLastRow();
+  if (ult > 1) sh.deleteRows(2, ult - 1);
+}
+
+/**
+ * Apaga todos os bolões, cotas, jogos, auditoria (com as imagens dos comprovantes) e conferências.
+ * Mantém administradores, PIX, QR, banners e convites ainda não usados.
+ * Com incluirParticipantes, apaga também as contas que não são de administrador.
+ */
+function limparTudo(d) {
+  return comLock(function () {
+    if (d.confirmacao !== 'APAGAR TUDO') throw erroNegocio('Confirmação incorreta. Digite exatamente APAGAR TUDO.');
+    var antes = contagemLimpeza();
+
+    lerTabela('Auditoria').forEach(function (e) { if (e.imagemId) removerImagemInterna(e.imagemId); });
+    ['Jogos', 'Cotas', 'Auditoria', 'Conferencias', 'Boloes'].forEach(apagarLinhasDaAba);
+
+    if (d.incluirParticipantes === true) {
+      var alvo = {};
+      var usuarios = lerTabela('Usuarios').filter(function (u) { return u.papel === 'participante'; });
+      usuarios.forEach(function (u) { alvo[u.id] = true; });
+      var sessoes = lerTabela('Sessoes').filter(function (s) { return alvo[s.userId]; }).sort(function (a, b) { return b._linha - a._linha; });
+      sessoes.forEach(function (s) { removerLinha('Sessoes', s._linha); });
+      var convites = lerTabela('Convites').filter(function (c) { return c.usadoPor && alvo[c.usadoPor]; }).sort(function (a, b) { return b._linha - a._linha; });
+      convites.forEach(function (c) { removerLinha('Convites', c._linha); });
+      usuarios.sort(function (a, b) { return b._linha - a._linha; }).forEach(function (u) { removerLinha('Usuarios', u._linha); });
+    }
+    console.log('Limpeza de dados de teste: ' + JSON.stringify(antes) + ' (participantes incluídos: ' + (d.incluirParticipantes === true) + ')');
+    return antes;
+  });
+}
+
+
+// ======================= backend/src/13_loterias.js =======================
+// ===== Resultados das loterias (fonte configurável pelo administrador) =====
+var LOTERIAS = [
+  { chave: 'megasena',  nome: 'Mega-Sena' },
+  { chave: 'lotofacil', nome: 'Lotofácil' },
+  { chave: 'quina',     nome: 'Quina' }
+];
+var LOTERIAS_BASE_PADRAO = 'https://servicebus2.caixa.gov.br/portaldeloterias/api/';
+var LOTERIAS_CACHE_CHAVE = 'loterias.v1';
+var LOTERIAS_CACHE_OK_S = 1800;   // resultado completo: 30 minutos
+var LOTERIAS_CACHE_FALHA_S = 120; // algo falhou: tenta de novo em 2 minutos
+
+/** Vazio = fonte padrão. Aceita "{loteria}" no endereço; sem ele, o nome da loteria é colocado no fim. */
+function validarBaseLoterias(u) {
+  u = String(u === undefined || u === null ? '' : u).trim();
+  if (u === '') return '';
+  if (!/^https:\/\/[^\s?#]+$/i.test(u) || u.length > 200) throw erroNegocio('O endereço da fonte deve começar com https:// e não ter espaços, ? ou #.');
+  if (u.indexOf('{loteria}') === -1 && u.charAt(u.length - 1) !== '/') u += '/';
+  return u;
+}
+
+function baseLoteriasDe(c) {
+  return c['loterias.apiBase'] || LOTERIAS_BASE_PADRAO;
+}
+
+function urlLoteria(base, m) {
+  return base.indexOf('{loteria}') !== -1 ? base.replace('{loteria}', m.chave) : base + m.chave;
+}
+
+/** Só aceita o que esperamos: números como número, dezenas como "01".."99", textos curtos. */
+function normalizarLoteria(m, d) {
+  d = d || {};
+  var rateio = d.listaRateioPremio || d.premiacoes || [];
+  var faixa = rateio[0] || {};
+  var bruto = faixa.numeroDeGanhadores !== undefined ? faixa.numeroDeGanhadores
+    : (faixa.ganhadores !== undefined ? faixa.ganhadores : faixa.vencedores);
+  var dezenas = (d.listaDezenas || d.dezenas || []).map(function (x) { return String(x); })
+    .filter(function (x) { return /^\d{1,2}$/.test(x); })
+    .map(function (x) { return x.length === 1 ? '0' + x : x; });
+  return {
+    chave: m.chave,
+    nome: m.nome,
+    concurso: Number(d.numero !== undefined ? d.numero : d.concurso) || 0,
+    data: String(d.dataApuracao || d.data || '').substring(0, 20),
+    dezenas: dezenas,
+    ganhadores: Number(bruto) || 0,
+    acumulou: d.acumulado !== undefined ? !!d.acumulado : !!d.acumulou,
+    proximoPremio: Number(d.valorEstimadoProximoConcurso || d.valorAcumuladoProximoConcurso) || 0,
+    proximoData: String(d.dataProximoConcurso || '').substring(0, 20)
+  };
+}
+
+/** Busca uma loteria na fonte. Lança erro com o motivo se falhar. */
+function buscarUmaLoteria(base, m) {
+  var r = UrlFetchApp.fetch(urlLoteria(base, m), { muteHttpExceptions: true });
+  if (r.getResponseCode() !== 200) throw new Error('HTTP ' + r.getResponseCode());
+  var item = normalizarLoteria(m, JSON.parse(r.getContentText()));
+  if (!item.concurso || item.dezenas.length === 0) throw new Error('resposta sem concurso ou dezenas');
+  return item;
+}
+
+function buscarResultadosLoterias(base) {
+  var p = props();
+  var lista = [];
+  var falhas = [];
+  LOTERIAS.forEach(function (m) {
+    try {
+      var item = buscarUmaLoteria(base, m);
+      lista.push(item);
+      p.setProperty('loterias.ultimo.' + m.chave, JSON.stringify(item));
+    } catch (e) {
+      falhas.push(m.nome + ': ' + (e && e.message ? e.message : e));
+      var ultimo = p.getProperty('loterias.ultimo.' + m.chave); // se a fonte cair, mostra o último resultado bom
+      if (ultimo) lista.push(JSON.parse(ultimo));
+    }
+  });
+  return { lista: lista, falhas: falhas };
+}
+
+/** Público: resultados com cache de 30 minutos (visitantes não derrubam a fonte). */
+function loteriasPublicas() {
+  var c = lerConfig();
+  if (c['loterias.ativo'] === '0') return { ativo: false, loterias: [] };
+  var cache = CacheService.getScriptCache();
+  var guardado = cache.get(LOTERIAS_CACHE_CHAVE);
+  if (guardado) return JSON.parse(guardado);
+  var r = buscarResultadosLoterias(baseLoteriasDe(c));
+  var saida = { ativo: true, atualizadoEm: RELOGIO.agora(), loterias: r.lista };
+  if (r.falhas.length > 0) console.error('Loterias: ' + r.falhas.join(' | '));
+  cache.put(LOTERIAS_CACHE_CHAVE, JSON.stringify(saida), r.falhas.length > 0 ? LOTERIAS_CACHE_FALHA_S : LOTERIAS_CACHE_OK_S);
+  return saida;
+}
+
+function limparCacheLoterias() {
+  CacheService.getScriptCache().remove(LOTERIAS_CACHE_CHAVE);
+}
+
+/** Admin: testa uma fonte (a digitada ou a salva) sem usar o cache e sem gravar nada. */
+function testarFonteLoterias(d) {
+  var digitada = validarBaseLoterias(d.apiBase);
+  var base = digitada || baseLoteriasDe(lerConfig());
+  return LOTERIAS.map(function (m) {
+    try {
+      var i = buscarUmaLoteria(base, m);
+      return { chave: m.chave, nome: m.nome, ok: true, concurso: i.concurso, dezenas: i.dezenas.length, ganhadores: i.ganhadores, acumulou: i.acumulou };
+    } catch (e) {
+      return { chave: m.chave, nome: m.nome, ok: false, erro: String(e && e.message ? e.message : e).substring(0, 120) };
+    }
+  });
+}
+
+
+// ======================= backend/src/14_publicidade_contagem_usuarios.js =======================
+// ===== Administrador de propagandas, relógio de contagem, aba Usuários e preparação da planilha =====
+
+/** O administrador de propagandas nunca recebe os dados do PIX. */
+function configParaPapel(u, cfg) {
+  if (u && u.papel !== 'admin') {
+    cfg.pix = { chave: '', nome: '', cidade: '', instrucoes: '', qrImagemId: '' };
+  }
+  return cfg;
+}
+
+/** O administrador de propagandas só mexe em espaços de propaganda e resultados das loterias. */
+function restringirPublicidade(u, d, camposProibidos) {
+  if (!u || u.papel === 'admin') return;
+  camposProibidos.forEach(function (c) {
+    if (d[c] !== undefined) throw erroNegocio('Sem permissão para alterar: ' + c + '.');
+  });
+}
+
+function exigirUsoSlot(u, uso) {
+  if (u && u.papel === 'publicidade' && !/^slot_[a-z_]+$/.test(String(uso))) {
+    throw erroNegocio('Sem permissão para este tipo de imagem.');
+  }
+}
+
+// ----- relógio de contagem regressiva -----
+var CONTAGEM_PADRAO = { titulo: 'MEGA SENA DA VIRADA +R$1 BILHÃO', data: '2027-01-01T11:00:00-03:00' };
+
+function lerContagem() {
+  var c = lerConfig();
+  var configurado = !!c['contagem.data'];
+  return {
+    configurado: configurado,
+    ativo: c['contagem.ativo'] !== '0',
+    titulo: configurado ? (c['contagem.titulo'] || CONTAGEM_PADRAO.titulo) : CONTAGEM_PADRAO.titulo,
+    data: configurado ? c['contagem.data'] : CONTAGEM_PADRAO.data
+  };
+}
+
+/** A data é sempre gravada no horário de Brasília (-03:00). */
+function salvarContagem(d) {
+  return comLock(function () {
+    var titulo = limparTexto(d.titulo, 80);
+    if (!titulo) throw erroNegocio('Informe o título do relógio.');
+    var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(d.dataLocal === undefined || d.dataLocal === null ? '' : d.dataLocal));
+    if (!m) throw erroNegocio('Informe a data e a hora do sorteio.');
+    var ano = Number(m[1]), mes = Number(m[2]), dia = Number(m[3]), hora = Number(m[4]), min = Number(m[5]);
+    var t = new Date(Date.UTC(ano, mes - 1, dia, hora, min));
+    if (t.getUTCFullYear() !== ano || t.getUTCMonth() !== mes - 1 || t.getUTCDate() !== dia || hora > 23 || min > 59) {
+      throw erroNegocio('Data ou hora inválida.');
+    }
+    gravarConfig({ 'contagem.ativo': d.ativo === false ? '0' : '1', 'contagem.titulo': titulo, 'contagem.data': m[0] + ':00-03:00' });
+    return lerContagem();
+  });
+}
+
+// ----- aba Usuários (administrador principal) -----
+function listarUsuarios() {
+  return lerTabela('Usuarios').map(function (u) {
+    return { id: u.id, usuario: u.usuario, nome: u.nome, papel: u.papel, status: u.status };
+  });
+}
+
+function redefinirUsuario(admin, d) {
+  var usuario = normalizarUsuario(d.usuario);
+  validarUsuario(usuario);
+  validarSenha(d.senha, usuario);
+  var registro = hashSenha(d.senha, iteracoesHash()); // custo alto: fora do lock
+  return comLock(function () {
+    var todos = lerTabela('Usuarios');
+    var alvo = todos.filter(function (x) { return x.id === d.id; })[0];
+    if (!alvo) throw erroNegocio('Conta não encontrada.');
+    if (alvo.id === admin.id) throw erroNegocio('Para a sua própria conta, peça a outro administrador.');
+    if (todos.some(function (x) { return x.usuario === usuario && x.id !== alvo.id; })) throw erroNegocio('Este nome de usuário já está em uso.');
+    alvo.usuario = usuario;
+    alvo.hashSenha = registro;
+    alvo.tentativas = 0;
+    alvo.bloqueadoAte = 0;
+    atualizar('Usuarios', alvo._linha, alvo);
+    lerTabela('Sessoes').filter(function (s) { return s.userId === alvo.id; })
+      .sort(function (a, b) { return b._linha - a._linha; })
+      .forEach(function (s) { removerLinha('Sessoes', s._linha); });
+    return { id: alvo.id, usuario: alvo.usuario };
+  });
+}
+
+// ======================= Preparação da NOVA planilha e dos administradores =======================
+// Rode estas funções manualmente, no editor do Apps Script, da conta Google (e-mail) que será a dona do sistema novo.
+
+/**
+ * Use SOMENTE se o script NÃO foi criado por Extensões > Apps Script dentro da planilha nova
+ * (script avulso). Cole o ID da planilha (o trecho entre /d/ e /edit na URL) e execute.
+ */
+function configurarPlanilhaPorId() {
+  var ID_DA_PLANILHA = 'COLE_AQUI_O_ID_DA_PLANILHA';
+  if (ID_DA_PLANILHA.indexOf('COLE_AQUI') === 0) throw new Error('Edite ID_DA_PLANILHA antes de executar.');
+  var ss = SpreadsheetApp.openById(ID_DA_PLANILHA);
+  props().setProperty('PLANILHA_ID', ss.getId());
+  PLANILHA_EM_CACHE = null;
+  var nomes = Object.keys(CFG.ABAS);
+  for (var i = 0; i < nomes.length; i++) {
+    var cols = CFG.ABAS[nomes[i]];
+    var sh = ss.getSheetByName(nomes[i]) || ss.insertSheet(nomes[i]);
+    sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  Logger.log('Planilha configurada: ' + ss.getName() + '. Abas: ' + nomes.join(', '));
+}
+
+/**
+ * Cria os logins dos administradores direto na planilha (sem convite).
+ * 1) Preencha usuario, nome e senha abaixo (a senha precisa de 8+ caracteres).
+ * 2) Execute criarAdministradores().
+ * 3) DEPOIS APAGUE AS SENHAS deste arquivo e salve de novo.
+ * Quem já existe (mesmo usuário) é ignorado.
+ */
+var SETUP_ADMINISTRADORES = [
+  { papel: 'admin',       usuario: '', nome: '', senha: '' },  // bolões e clientes
+  { papel: 'publicidade', usuario: '', nome: '', senha: '' }   // propagandas, loterias e relógio
+];
+
+function criarAdministradores() {
+  var criados = [];
+  SETUP_ADMINISTRADORES.forEach(function (a) {
+    if (!a.usuario && !a.senha) return; // linha em branco: pula
+    var usuario = normalizarUsuario(a.usuario);
+    validarUsuario(usuario);
+    var nome = limparTexto(a.nome, 60);
+    if (nome.length < 2) throw erroNegocio('Informe o nome de ' + usuario + ' (mínimo 2 caracteres).');
+    validarSenha(a.senha, usuario);
+    var registro = hashSenha(a.senha, iteracoesHash());
+    comLock(function () {
+      if (lerTabela('Usuarios').some(function (u) { return u.usuario === usuario; })) {
+        Logger.log('Já existe o usuário "' + usuario + '". Ignorado.');
+        return;
+      }
+      inserir('Usuarios', {
+        id: novoId(), usuario: usuario, nome: nome, hashSenha: registro, papel: a.papel, status: 'ativo',
+        tentativas: 0, bloqueadoAte: 0, criadoEm: RELOGIO.agora(), conviteId: ''
+      });
+      criados.push(usuario + ' (' + a.papel + ')');
+    });
+  });
+  Logger.log(criados.length ? 'Criados: ' + criados.join(', ') + '. AGORA APAGUE AS SENHAS DE SETUP_ADMINISTRADORES.' : 'Nenhum usuário novo criado.');
+}
+
+/** Alternativa por convite: gera o código de uso único do administrador de propagandas (aparece no registro de execução). */
+function convitePropagandas() {
+  var conv = comLock(function () { return criarConviteInterno('publicidade', 'sistema', CFG.CONVITE_HORAS_PADRAO); });
+  Logger.log('CÓDIGO DO ADMINISTRADOR DE PROPAGANDAS (uso único, válido por ' + CFG.CONVITE_HORAS_PADRAO + 'h): ' + conv.codigo);
+}

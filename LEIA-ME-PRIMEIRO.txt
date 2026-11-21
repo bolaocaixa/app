@@ -1,0 +1,7 @@
+ORDEM:
+1) Copie para ESTA pasta (mantendo as subpastas) os arquivos do projeto antigo:
+   config.js                      -> raiz (ao lado de index.html)
+   util.js ui.js imagens.js slots.js loterias.js publico.js publico-extras.js -> pasta js
+2) Abra config.js e troque API_URL pela URL /exec do backend NOVO.
+3) De duplo clique em verificar.bat (deve mostrar TUDO CERTO).
+4) De duplo clique em publicar.bat.
